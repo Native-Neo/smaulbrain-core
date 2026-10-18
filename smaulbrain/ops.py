@@ -2,7 +2,6 @@
 import torch
 
 EPS = 1e-6
-MAX_TMP_ELEMENTS = 1 << 26
 
 
 def _tensor(x, device=None):
