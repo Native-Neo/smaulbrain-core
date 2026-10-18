@@ -87,7 +87,8 @@ class ExpertStore:
 
     def remove_expert(self,eid):
         eid=int(eid);self.ram_weights.pop(eid,None);self.cache.pop(eid,None);self._dirty.discard(eid)
-        for path in (self._path(eid),os.path.join(self.disk_dir or "",f"expert_{eid}.npz")):
+        if self.disk_dir is None:return
+        for path in (self._path(eid),os.path.join(self.disk_dir,f"expert_{eid}.npz")):
             try:os.remove(path)
             except OSError:pass
 
