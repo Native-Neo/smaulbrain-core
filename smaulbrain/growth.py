@@ -58,6 +58,7 @@ class GrowthScheduler:
             "next_periodic_step": self.next_periodic_step,
             "loss_threshold": self.loss_threshold,
             "loss_beta": self.loss_beta,
+            "min_eval_samples": self.min_eval_samples,
             "smooth_loss": self.smooth_loss,
             "loss_armed": self.loss_armed,
             "event_count": self.event_count,
@@ -67,10 +68,13 @@ class GrowthScheduler:
         }
 
     @classmethod
-    def from_record(cls, rec: dict):
+    def from_record(cls, rec: dict, min_eval_samples=None):
+        # Legacy records predate min_eval_samples; the caller's value applies then.
+        fallback = 256 if min_eval_samples is None else int(min_eval_samples)
         s = cls(every_steps=rec.get("growth_every_steps", 10000),
                 loss_nats=rec.get("loss_threshold", 0.5),
-                loss_beta=rec.get("loss_beta", 0.98))
+                loss_beta=rec.get("loss_beta", 0.98),
+                min_eval_samples=int(rec.get("min_eval_samples", fallback)))
         s.global_step = int(rec.get("global_step", 0))
         s.smooth_loss = rec.get("smooth_loss")
         s.loss_armed = bool(rec.get("loss_armed", True))
@@ -159,11 +163,12 @@ def rank_experts(model, eval_batches, min_samples: int, max_batches=None):
     batches = list(eval_batches if max_batches is None else eval_batches[:max_batches])
     if not batches: return None, total
     base = [eval_loss_on_tokens(model, b) for b in batches]
+    base_mean = sum(base) / len(base)
     from . import model as _m
     scores = {}
     for eid in _m.expert_ids(model.p):
         masked = [eval_loss_on_tokens_disabled(model, b, eid) for b in batches]
-        scores[eid] = float(sum(masked) / len(masked) - sum(base) / len(base))
+        scores[eid] = float(sum(masked) / len(masked) - base_mean)
     return scores, total
 
 
