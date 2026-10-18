@@ -1,0 +1,59 @@
+[build-system]
+requires = ["setuptools>=77"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "smaulbrain-core"
+dynamic = ["version"]
+description = "Byte-level recurrent language model with mixture-of-experts, ternary/FP8 quantization, and a factored optimizer, on PyTorch."
+readme = "README.md"
+requires-python = ">=3.9"
+license = "LicenseRef-SmaulBRAIN"
+license-files = ["LICENSE"]
+authors = [{ name = "Yash and contributors to SmaulBRAIN" }]
+keywords = [
+    "language-model",
+    "mixture-of-experts",
+    "moe",
+    "quantization",
+    "ternary",
+    "pytorch",
+    "byte-level",
+]
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Intended Audience :: Developers",
+    "Intended Audience :: Science/Research",
+    "Operating System :: OS Independent",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.9",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Topic :: Scientific/Engineering :: Artificial Intelligence",
+]
+dependencies = [
+    "torch>=2.6",
+    "numpy>=1.24",
+]
+
+[project.optional-dependencies]
+test = ["pytest>=8"]
+
+[project.urls]
+Homepage = "https://github.com/Native-Neo/SmaulBRAIN"
+Repository = "https://github.com/Native-Neo/SmaulBRAIN"
+Issues = "https://github.com/Native-Neo/SmaulBRAIN/issues"
+
+[tool.setuptools]
+packages = ["smaulbrain", "smaulbrain.kernels"]
+py-modules = []
+include-package-data = false
+
+[tool.setuptools.dynamic]
+version = { attr = "smaulbrain.__version__" }
+
+[tool.setuptools.package-data]
+smaulbrain = ["*.cpp"]
+"smaulbrain.kernels" = ["*.cpp"]
