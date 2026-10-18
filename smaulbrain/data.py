@@ -28,7 +28,8 @@ class ByteStream:
     def _read_at(self, off: int, n: int) -> bytes:
         if self._data is not None:
             return self._data[off:off + n]
-        assert self.path is not None and self._fh is not None
+        if self._fh is None:
+            raise ValueError("ByteStream is closed")
         self._fh.seek(off)
         return self._fh.read(n)
 
@@ -44,6 +45,8 @@ class ByteStream:
         self.close()
 
     def next_tokens(self, seq_len: int) -> list:
+        if seq_len < 1:
+            raise ValueError(f"seq_len must be >= 1, got {seq_len}")
         n = seq_len + 1  # +1 so loss has a target for every input position
         if self.size < n:
             raise ValueError(f"corpus ({self.size}B) smaller than seq_len {seq_len}")
