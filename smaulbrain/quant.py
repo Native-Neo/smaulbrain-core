@@ -28,7 +28,7 @@ def _np(x, dtype=None):
 
 
 def ternary_threshold(W):
-    W = _tensor(W); return float(0.7 * W.abs().mean().item())
+    W = _tensor(W); return float(0.7 * W.abs().double().mean().item())
 
 
 def ternary_scale(W, q):
