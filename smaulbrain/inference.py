@@ -11,7 +11,7 @@ class InferenceEngine:
 
     def reset(self):self.states=self.model.init_states()
     def export_states(self):return self.model.serialize_states(self.states)
-    def import_states(self,blob):self.states=[torch.as_tensor(blob[str(i)],dtype=torch.float32,device=self.model.device) for i in range(len(blob))]
+    def import_states(self,blob):self.states=[s.to(self.model.device) for s in self.model.restore_states(blob)]
 
     def prefill(self,tokens,chunk=0):
         toks=list(tokens)
@@ -33,11 +33,7 @@ class InferenceEngine:
         return int(torch.multinomial(probs,1,generator=self.generator).item())
 
     def generate(self,prompt_tokens,max_new_tokens=64,stop_ids=()):
-        prompt=list(prompt_tokens);self.prefill(prompt);out=[];last=prompt[-1] if prompt else 0;stop=set(stop_ids)
-        for _ in range(max_new_tokens):
-            nxt=self._sample(self.model.step_token(last,self.states));out.append(nxt);last=nxt
-            if nxt in stop:break
-        return out
+        return list(self.generate_stream(prompt_tokens,max_new_tokens,stop_ids))
 
     def generate_stream(self,prompt_tokens,max_new_tokens=64,stop_ids=()):
         prompt=list(prompt_tokens);self.prefill(prompt);last=prompt[-1] if prompt else 0;stop=set(stop_ids)
