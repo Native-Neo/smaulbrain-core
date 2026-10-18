@@ -32,16 +32,18 @@ class Router:
         top_scores = scores.gather(1, idx)
         raw_weights = torch.softmax(top_scores, dim=1)
         T = X.shape[0]; cap = max(1, math.ceil(capacity_factor * T * top_k / self.n_experts))
-        keep = torch.ones_like(idx, dtype=torch.bool)
         flat = idx.reshape(-1)
-        for eid in torch.unique(flat, sorted=True).tolist():
-            positions = torch.nonzero(flat == eid, as_tuple=False).flatten()
-            if positions.numel() > cap:
-                keep.view(-1)[positions[cap:]] = False
+        order = torch.argsort(flat, stable=True)
+        sorted_flat = flat[order]
+        counts = torch.bincount(sorted_flat, minlength=self.n_experts)
+        starts = torch.cumsum(counts, 0) - counts
+        rank = torch.arange(flat.numel(), device=flat.device) - starts[sorted_flat]
+        keep = torch.ones_like(flat, dtype=torch.bool)
+        keep[order[rank >= cap]] = False
+        keep = keep.view_as(idx)
         kept = raw_weights * keep.to(raw_weights.dtype)
         denom = kept.sum(dim=1, keepdim=True)
         weights = torch.where(denom > 0, kept / denom.clamp_min(1e-12), torch.zeros_like(kept))
-        counts = torch.bincount(flat, minlength=self.n_experts)
         load = counts.clamp(max=cap)
         info = {"overflow_dropped": int(flat.numel() - load.sum().item()), "cap_per_expert": cap,
                 "load": load.detach().cpu().tolist()}
