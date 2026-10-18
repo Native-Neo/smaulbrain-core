@@ -13,10 +13,11 @@ def _sha256(path):
     return h.hexdigest()
 
 
-def blank_scheduler_state(growth_every_steps=10000,growth_loss_nats=0.5,loss_beta=0.98):
+def blank_scheduler_state(growth_every_steps=10000,growth_loss_nats=0.5,loss_beta=0.98,min_eval_samples=256):
     interval=int(growth_every_steps)
     return {"global_step":0,"growth_every_steps":interval,"next_periodic_step":interval if interval>0 else None,
-            "loss_threshold":growth_loss_nats,"loss_beta":float(loss_beta),"smooth_loss":None,"loss_armed":True,
+            "loss_threshold":growth_loss_nats,"loss_beta":float(loss_beta),"min_eval_samples":int(min_eval_samples),
+            "smooth_loss":None,"loss_armed":True,
             "event_count":0,"last_growth_step":None,"history":[],"pending":None}
 
 
@@ -73,11 +74,16 @@ def _json_default(o):
 
 
 def save_checkpoint(target_dir,manifest,params,opt_state):
-    hist=manifest.get("scheduler",{}).get("history",[])
-    if any(not isinstance(c.get("id"),int) for c in hist):raise ValueError("committed history entries require integer ids")
+    sched=manifest.get("scheduler") or {}
+    if not isinstance(sched,dict):raise ValueError("scheduler state must be an object")
+    hist=sched.get("history",[])
+    if not isinstance(hist,list):raise ValueError("scheduler history must be a list")
+    if any(not isinstance(c,dict) or not isinstance(c.get("id"),int) for c in hist):
+        raise ValueError("committed history entries require integer ids")
     ids=[c["id"] for c in hist]
     if len(set(ids))!=len(ids):raise ValueError("duplicate committed event ids")
-    pending=manifest.get("scheduler",{}).get("pending")
+    pending=sched.get("pending")
+    if pending is not None and not isinstance(pending,dict):raise ValueError("scheduler pending must be an object")
     if pending is not None and pending.get("id") in ids:raise ValueError("pending event id already committed")
     _check_consistency(manifest,params)
     return _write_tree(target_dir,manifest,params,opt_state)
