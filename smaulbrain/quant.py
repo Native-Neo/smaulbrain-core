@@ -4,6 +4,7 @@ All trainable weights and activations remain torch.Tensor objects. The native
 backend uses a narrow CPU buffer bridge for packed ternary matrix operations;
 it never stores a dense dequantized weight matrix.
 """
+import ctypes
 import torch
 from . import _quant_native as _native
 
@@ -117,19 +118,34 @@ def packed_matvec(x, packed, shape, scale, allow_dense_reconstruction=False):
     return packed_matmat(x, packed, shape, scale, allow_dense_reconstruction)
 
 
+_FP8_TABLES = {}
+
+
+def _fp8_table(device):
+    key = str(device)
+    table = _FP8_TABLES.get(key)
+    if table is None:
+        table = torch.as_tensor(_native._FP8_POSITIVE_VALUES.copy(), device=device, dtype=torch.float64)
+        _FP8_TABLES[key] = table
+    return table
+
+
 def fp8_e4m3_quantize(W, scale=None):
     W = _tensor(W)
-    table = torch.as_tensor(_native._FP8_POSITIVE_VALUES.copy(), device=W.device, dtype=torch.float64)
+    table = _fp8_table(W.device)
     wf = W.double()
     if scale is None:
         finite = wf[torch.isfinite(wf)].abs()
         mx = float(finite.max().item()) if finite.numel() else 0.0
         scale = mx / FP8_E4M3_MAX if mx > 0 else 1.0
-    scale = float(torch.tensor(float(scale), dtype=torch.float32).item()) or 1.0
+    try:
+        scale = ctypes.c_float(float(scale)).value or 1.0
+    except OverflowError:
+        scale = float("inf")
     norm = wf / scale
     finite = torch.isfinite(norm)
     mag = torch.where(finite, norm.abs().clamp(max=FP8_E4M3_MAX), torch.zeros_like(norm))
-    hi = torch.searchsorted(table, mag.contiguous()).clamp(max=table.numel() - 1)
+    hi = torch.searchsorted(table, mag).clamp(max=table.numel() - 1)
     lo = (hi - 1).clamp(min=0)
     lower, upper = table[lo], table[hi]
     nearest = torch.where((upper - mag) < (mag - lower), upper, lower)
