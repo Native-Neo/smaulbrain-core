@@ -87,8 +87,25 @@ def try_load():
                           "reason": "native module not built; using portable scalar/numpy path",
                           "cpu": caps, "dispatch": _cpu.dispatch_name()}
         lib = ctypes.CDLL(cands[0])
+        # Declare scalar signatures; without these every Python float argument
+        # would be passed as a C double and silently misread by the callee.
+        ptr_f32 = ctypes.POINTER(ctypes.c_float)
+        ptr_u8 = ctypes.POINTER(ctypes.c_uint8)
+        lib.rmsnorm_fwd.argtypes = [ptr_f32, ptr_f32, ptr_f32, ctypes.c_int, ctypes.c_float]
+        lib.rmsnorm_fwd.restype = None
+        lib.ternary_pack.argtypes = [ptr_f32, ptr_u8, ctypes.c_int, ptr_f32, ptr_f32]
+        lib.ternary_pack.restype = None
+        lib.packed_matvec.argtypes = [ptr_f32, ptr_u8, ptr_f32, ctypes.c_int, ctypes.c_int,
+                                      ctypes.c_float]
+        lib.packed_matvec.restype = None
+        lib.recurrent_step.argtypes = [ptr_f32, ptr_f32, ptr_f32, ptr_f32, ptr_f32, ptr_f32,
+                                       ptr_f32, ptr_f32, ctypes.c_int]
+        lib.recurrent_step.restype = None
+        lib.clone_perturb.argtypes = [ptr_f32, ptr_f32, ctypes.c_int, ctypes.c_uint,
+                                      ctypes.c_float, ctypes.c_int]
+        lib.clone_perturb.restype = None
         return lib, {"available": True, "path": cands[0], "cpu": caps,
                      "dispatch": _cpu.dispatch_name()}
-    except OSError as e:
+    except (OSError, AttributeError) as e:
         return None, {"available": False, "reason": f"native load failed: {e}",
                       "cpu": caps}
