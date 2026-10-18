@@ -18,7 +18,6 @@ from dataclasses import dataclass, field
 
 from . import vocab as _vocab
 
-GROWTH_DEFAULT_EVERY_STEPS = 10000
 GROWTH_DEFAULT_LOSS_NATS = 0.5
 
 PAGING_MODES = ("R", "V", "D2R", "D2V", "R2V")
@@ -32,15 +31,6 @@ SUPPORTED_QUANT_COMBOS = {
     ("ternary", "fp32"),
     ("ternary", "ternary"),
     ("ternary", "fp8"),
-}
-
-PRESET_ALIASES = {
-    "full": None,  # resolved only together with --moe/--dense
-    "tiny": None,
-    "moe-full": "moe-full",
-    "moe-tiny": "moe-tiny",
-    "dense-full": "dense-full",
-    "dense-tiny": "dense-tiny",
 }
 
 VALID_PRESETS = ("moe-full", "moe-tiny", "dense-full", "dense-tiny")
@@ -79,8 +69,6 @@ PRESETS: dict = {
 
 EXPECTED_EXPERT_PARAMS = {"moe-full": 5_120_000, "moe-tiny": 10_240}
 EXPECTED_DENSE_TOTAL = {"dense-full": 256_000_000, "dense-tiny": 256_000}
-GROWTH_ADD_FULL = 8
-GROWTH_ADD_TINY = 2
 
 
 def dense_param_total(spec: PresetSpec) -> int:
@@ -96,13 +84,9 @@ def expert_param_count(spec: PresetSpec) -> int:
 def shared_param_total(spec: PresetSpec) -> int:
     """Non-expert trainable params of an MoE model (embed+recurrent+norms+router)."""
     d, L, V = spec.d_model, spec.n_layers, spec.vocab_size
-    per_layer = 4 * d * d + 4 * d  # attention+decay+bonus+2 norms, no FFN (experts replace it)
-    # each MoE layer keeps a small gate projection d*d for expert-input mixing? No:
-    # channel mixing lives inside experts, so shared per-layer has no FFN params.
-    embed = V * d
-    final_norm = d
-    router = d * spec.n_experts_init
-    return embed + final_norm + L * per_layer + router
+    # channel mixing lives inside experts, so shared layers have no FFN params
+    per_layer = 4 * d * d + 4 * d
+    return V * d + d + L * per_layer + d * spec.n_experts_init
 
 
 def whole_model_total(spec: PresetSpec, n_experts=None) -> int:
