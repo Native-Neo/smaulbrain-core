@@ -46,26 +46,23 @@ def prune_checkpoint(ckpt_dir: str, rm_worst: int, eval_batches, min_samples: in
     if not assume_yes:
         raise RuntimeError(f"refusing destructive replacement without --yes; "
                            f"dry-run report: {report}")
-    keep = [e for e in eids if e not in set(victims)]
+    removed = set(victims)
+    keep = [e for e in eids if e not in removed]
     remap = {old: new for new, old in enumerate(keep)}
     new_params = {k: v for k, v in params.items() if not k.startswith("expert.")}
     for old in keep:
         for suffix in ("Win", "Wout"):
             new_params[f"expert.{remap[old]}.{suffix}"] = params[f"expert.{old}.{suffix}"]
-    # shrink router rows? router is d x E: drop pruned columns
     R = params["router"]
     new_params["router"] = R[:, keep].clone()
-    # optimizer state: drop pruned experts, rebuild router entry
     opt_state = blob["opt_state"]
     new_opt = {k: v for k, v in opt_state.items()
-               if not (k.startswith("expert.") and int(k.split(".")[1]) in set(victims))}
+               if not (k.startswith("expert.") and int(k.split(".")[1]) in removed)}
     renamed = {}
     for k, v in new_opt.items():
         if k.startswith("expert."):
             parts = k.split(".")
             renamed[f"expert.{remap[int(parts[1])]}.{'.'.join(parts[2:])}"] = v
-        elif k == "router":
-            renamed[k] = v  # router state resized on load/adopt; mark below
         else:
             renamed[k] = v
     man2 = dict(man)
@@ -75,10 +72,8 @@ def prune_checkpoint(ckpt_dir: str, rm_worst: int, eval_batches, min_samples: in
     man2.setdefault("prune_history", []).append(
         {"removed": victims, "scores": {str(v): scores[v] for v in victims},
          "prev_count": len(eids), "new_count": len(keep)})
-    # router optimizer state is shape-bound: drop it so it re-initializes
-    renamed.pop("router", None)
+    renamed.pop("router", None)  # shape-bound; re-initialized on load
     _ckpt.save_checkpoint(ckpt_dir, man2, new_params, renamed)
-    # validate: reload + inference smoke
     blob2 = _ckpt.load_checkpoint(ckpt_dir)
     m2 = _model.Model(spec, blob2["params"])
     logits, _ = m2.forward([65, 66, 67, 68], train=False)
