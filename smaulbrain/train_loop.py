@@ -67,29 +67,31 @@ class Trainer:
                                    staging_max_bytes=self.args.paging_staging_bytes)
 
     # -- checkpoint payload --
-    def _payload(self):
-        spec = self.spec
-        n_exp = len(_model.expert_ids(self.model.p)) if spec.kind == "moe" else 0
-        arch = _cfg.arch_report(spec, n_exp)
+    def _build_manifest(self, params):
+        n_exp = len(_model.expert_ids(params)) if self.spec.kind == "moe" else 0
+        arch = _cfg.arch_report(self.spec, n_exp)
         extra = {"forward_quant": self.model.forward_quant,
                  "backward_mode": self.model.backward_mode,
                  "paging": self.args.paging, "seed": self.args.seed,
                  "lr": self.args.lr, "seq_len": self.args.seq_len,
                  "capacity_factor": self.model.capacity_factor}
-        man = _ckpt.build_manifest(
-            spec.name, arch, extra, self.sched.to_record(),
+        factored = {k: bool(state["factored"]) for k, state in self.opt.state.items()}
+        return _ckpt.build_manifest(
+            self.spec.name, arch, extra, self.sched.to_record(),
             self.stream.cursor, {"torch_state": self.rng.get_state().tolist()},
             n_exp, list(range(n_exp)),
             {"class": "SmaulOPT", "lr": self.opt.lr, "beta1": self.opt.beta1,
              "beta2": self.opt.beta2, "eps": self.opt.eps,
-             "weight_decay": self.opt.weight_decay})
-        # Checkpoint writing is synchronous, so the serializer can read live
-        # arrays directly. Avoid duplicating the entire parameter dict and the
-        # optimizer's potentially multi-gigabyte moment tensors before writing.
-        opt_state = {k: {sk: sv for sk, sv in state.items() if sk != "factored"}
-                     for k, state in self.opt.state.items()}
-        man["optimizer"]["factored"] = {k: bool(state["factored"]) for k,state in self.opt.state.items()}
-        return man, self.model.p, opt_state
+             "weight_decay": self.opt.weight_decay, "factored": factored})
+
+    def _opt_state_payload(self):
+        # Serialization is synchronous, so live tensors can be referenced
+        # instead of copying the optimizer's moment tensors before writing.
+        return {k: {sk: sv for sk, sv in state.items() if sk != "factored"}
+                for k, state in self.opt.state.items()}
+
+    def _payload(self):
+        return self._build_manifest(self.model.p), self.model.p, self._opt_state_payload()
 
     def save(self, pending_phase=False):
         man, params, opt_state = self._payload()
@@ -101,7 +103,7 @@ class Trainer:
         man = blob["manifest"]
         if man["preset"] != self.spec.name:
             raise ValueError(f"checkpoint preset {man['preset']} != {self.spec.name}")
-        self.model.p = {k: v for k, v in blob["params"].items()}
+        self.model.p = blob["params"]
         self.model.packed.invalidate()
         self.model.fp8.invalidate()
         flags = man.get("optimizer", {}).get("factored", {})
@@ -110,7 +112,8 @@ class Trainer:
             for key,value in list(state.items()):
                 if isinstance(value, torch.Tensor): state[key] = value.to(self.model.device)
         self.opt.register(self.model.p)
-        self.sched = _growth.GrowthScheduler.from_record(man["scheduler"])
+        self.sched = _growth.GrowthScheduler.from_record(
+            man["scheduler"], min_eval_samples=self.args.growth_min_eval_samples)
         rng_state = man.get("rng_state", {})
         if "torch_state" in rng_state:
             self.rng.set_state(torch.tensor(rng_state["torch_state"], dtype=torch.uint8))
@@ -118,22 +121,9 @@ class Trainer:
         # tensors are exact, while newly introduced random experts use their recorded seed.
         self.stream.load_state_dict({"cursor": man["data_cursor"], "path": self.stream.path,
                                      "size": self.stream.size})
-        # rebuild paging store
         if self.spec.kind == "moe":
-            n_exp = man["n_experts_current"]
-            if self.args.paging in ("R", "V", "R2V"):
-                ram = {e: _expert_dict(self.model.p, e) for e in range(n_exp)}
-                self.model.store = _paging.ExpertStore(self.args.paging, n_exp, ram_weights=ram)
-            else:
-                dd = self._live_experts_dir()
-                os.makedirs(dd, exist_ok=True)
-                for e in range(n_exp):
-                    torch.save({k:v.detach().cpu() for k,v in _expert_dict(self.model.p, e).items()},
-                               os.path.join(dd, f"expert_{e}.pt"))
-                self.model.store = _paging.ExpertStore(
-                    self.args.paging, n_exp, disk_dir=dd,
-                    ram_cache_max_experts=self.args.paging_cache_experts,
-                    staging_max_bytes=self.args.paging_staging_bytes)
+            self.model.store = self._make_store(
+                self.args.paging, man["n_experts_current"], self.model.p, None)
         return man
 
     # -- growth resolution (no optimizer step may intervene) --
@@ -152,7 +142,6 @@ class Trainer:
 
     def _resolve_pending(self, fail_at=None):
         """Complete self.sched.pending through commit. Returns history entry."""
-        from . import growth as _g
         sched, spec = self.sched, self.spec
         pend = sched.pending
         assert pend is not None, "no pending growth event"
@@ -208,7 +197,7 @@ class Trainer:
         _growth.validate_candidate(spec, cand, None)
         pend["status"] = "VALIDATED"
         # smoke validation on an isolated model object (active model untouched)
-        probe = _model.Model(spec, {k: v for k, v in cand.items()},
+        probe = _model.Model(spec, cand,
                              forward_quant=self.model.forward_quant,
                              backward_mode=self.model.backward_mode,
                              paging_mode="R", paging_store=None,
@@ -244,24 +233,8 @@ class Trainer:
 
     def _save_committed(self, cand, entry, new_ids):
         """Phase B: atomically publish grown model + updated scheduler (no adopt yet)."""
-        model, sched, opt = self.model, self.sched, self.opt
-        n_exp = len(_model.expert_ids(cand))
-        arch = _cfg.arch_report(self.spec, n_exp)
-        extra = {"forward_quant": model.forward_quant, "backward_mode": model.backward_mode,
-                 "paging": self.args.paging, "seed": self.args.seed, "lr": self.args.lr,
-                 "seq_len": self.args.seq_len, "capacity_factor": model.capacity_factor}
-        man = _ckpt.build_manifest(
-            self.spec.name, arch, extra, sched.to_record(), self.stream.cursor,
-            {"torch_state": self.rng.get_state().tolist()}, n_exp, list(range(n_exp)),
-            {"class": "SmaulOPT", "lr": opt.lr, "beta1": opt.beta1, "beta2": opt.beta2,
-             "eps": opt.eps, "weight_decay": opt.weight_decay,
-             "factored": {k: bool(s["factored"]) for k, s in opt.state.items()}})
-        # optimizer state carried by name; router state carried per-column below
-        # _write_tree consumes array references synchronously; avoid a second
-        # copy of every optimizer tensor at the growth commit checkpoint.
-        opt_state = {k: {sk: sv for sk, sv in s.items() if not isinstance(sv, bool)}
-                     for k, s in opt.state.items()}
-        _ckpt.save_checkpoint(self.args.checkpoint, man, cand, opt_state)
+        _ckpt.save_checkpoint(self.args.checkpoint, self._build_manifest(cand), cand,
+                              self._opt_state_payload())
 
     def _resize_router_opt_state(self, cand):
         opt = self.opt
@@ -304,7 +277,7 @@ class Trainer:
             if not math.isfinite(loss):
                 raise RuntimeError(f"non-finite loss at step {self.sched.global_step}")
             # gradient clipping (global norm)
-            total_sq = sum(float(g.detach().double().square().sum().item()) for g in grads.values())
+            total_sq = sum(g.detach().square().sum(dtype=torch.float64).item() for g in grads.values())
             total = math.sqrt(total_sq)
             if not math.isfinite(total):
                 raise RuntimeError(f"non-finite gradient norm at step {self.sched.global_step}")
