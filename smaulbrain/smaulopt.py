@@ -31,6 +31,7 @@ class SmaulOPT:
 
     def step(self,params,grads,collect_norms=True):
         norms={}; b1=self.beta1; b2=self.beta2; eps=self.eps
+        omb1=1.0-b1; omb2=1.0-b2; wd=1.0-self.lr*self.weight_decay if self.weight_decay else None
         with torch.no_grad():
             for name,w in params.items():
                 g=grads.get(name)
@@ -43,16 +44,16 @@ class SmaulOPT:
                     if native is not None:
                         if collect_norms:norms[name]=native
                         continue
-                if self.weight_decay:w.mul_(1.0-self.lr*self.weight_decay)
-                st["m"].mul_(b1).add_(g,alpha=1.0-b1)
+                if wd is not None:w.mul_(wd)
+                st["m"].mul_(b1).add_(g,alpha=omb1)
                 g2=g.square()
                 if st["factored"]:
-                    st["R"].mul_(b2).add_(g2.mean(dim=1),alpha=1.0-b2)
-                    st["C"].mul_(b2).add_(g2.mean(dim=0),alpha=1.0-b2)
+                    st["R"].mul_(b2).add_(g2.mean(dim=1),alpha=omb2)
+                    st["C"].mul_(b2).add_(g2.mean(dim=0),alpha=omb2)
                     denom_r=st["R"].mean().clamp_min(1e-30)
                     vhat=(st["R"][:,None]*st["C"][None,:]/denom_r).clamp_min(0)
                 else:
-                    st["v"].mul_(b2).add_(g2,alpha=1.0-b2); vhat=st["v"].clamp_min(0)
+                    st["v"].mul_(b2).add_(g2,alpha=omb2); vhat=st["v"].clamp_min(0)
                 upd=st["m"]/(vhat.sqrt()+eps)
                 if collect_norms:norms[name]=float(upd.square().mean().sqrt().item())
                 w.add_(upd,alpha=-self.lr)
@@ -63,8 +64,8 @@ class SmaulOPT:
         return {k:{sk:(sv.clone() if isinstance(sv,torch.Tensor) else sv) for sk,sv in s.items() if sk!="factored"} for k,s in self.state.items()}
 
     def load_state_dict(self,sd,factored_flags=None):
-        self.state={}
+        flags=factored_flags or {}; self.state={}
         for k,s in sd.items():
             entry={sk:(torch.as_tensor(sv).clone() if not isinstance(sv,torch.Tensor) else sv.clone()) for sk,sv in s.items()}
-            entry["factored"]=bool(factored_flags.get(k,"R" in entry) if factored_flags else "R" in entry)
+            entry["factored"]=bool(flags.get(k,"R" in entry))
             self.state[k]=entry
