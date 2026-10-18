@@ -6,7 +6,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-from . import config as _cfg, moe as _moe, ops as _ops, quant as _quant, vocab as _vocab
+from . import config as _cfg, moe as _moe, ops as _ops, quant as _quant
 
 
 def build_params(spec, generator: torch.Generator | None = None, n_experts: int = -1, device="cpu"):
@@ -112,7 +112,7 @@ class Model(nn.Module):
                  capacity_factor: float=1.25, device="cpu"):
         super().__init__(); _cfg.validate_quant_combo(forward_quant,backward_mode)
         self.spec=spec; self.device=torch.device(device); self.param_names=[]; self.params=nn.ParameterList()
-        self.p=params
+        self._pd=None; self.p=params
         self.forward_quant=forward_quant; self.backward_mode=backward_mode; self.paging_mode=paging_mode
         self.store=paging_store; self.packed=PackedCache(); self.fp8=FP8Cache()
         self.loss_smooth_beta=float(loss_smooth_beta); self.capacity_factor=float(capacity_factor)
@@ -121,7 +121,10 @@ class Model(nn.Module):
         self._assert_counts()
 
     @property
-    def p(self): return {k:v for k,v in zip(self.param_names,self.params)}
+    def p(self):
+        if self._pd is None:
+            self._pd={k:v for k,v in zip(self.param_names,self.params)}
+        return self._pd
 
     @p.setter
     def p(self, values):
@@ -129,7 +132,7 @@ class Model(nn.Module):
         for k,v in values.items():
             t=v.detach().to(device=self.device,dtype=torch.float32).contiguous()
             vals.append(nn.Parameter(t,requires_grad=True)); names.append(k)
-        self.param_names=names; self.params=vals
+        self.param_names=names; self.params=vals; self._pd=None
 
     def _assert_counts(self):
         p=self.p
@@ -148,10 +151,11 @@ class Model(nn.Module):
         return rep
 
     def _linear(self,X,W,key):
-        kind=self.forward_quant; Wq=torch.empty(0,device=X.device)
-        packed=None; scale=1.0; shape=tuple(W.shape)
+        kind=self.forward_quant
+        if kind=="fp32": return X @ W
+        Wq=torch.empty(0,device=X.device); packed=None; scale=1.0; shape=tuple(W.shape)
         if kind=="fp8": Wq,scale=self.fp8.get(key,W)
-        elif kind=="ternary": packed,scale,shape=self.packed.get(key,W)
+        else: packed,scale,shape=self.packed.get(key,W)
         return _QuantLinear.apply(X,W,Wq,kind,self.backward_mode,packed,scale,shape)
 
     def _expert_weights(self,eid):
@@ -191,14 +195,17 @@ class Model(nn.Module):
     def _moe(self,X,disabled=()):
         p=self.p; router=_moe.Router.__new__(_moe.Router); router.W=p["router"]
         idx,weights,info,_=router.route(X,self.spec.top_k,self.capacity_factor,disabled)
-        Y=X.new_zeros(X.shape)
-        for eid in torch.unique(idx,sorted=True).tolist():
-            flatpos=torch.nonzero(idx.reshape(-1)==eid,as_tuple=False).flatten()
-            rows=torch.div(flatpos,self.spec.top_k,rounding_mode="floor"); cols=flatpos%self.spec.top_k
+        Y=X.new_zeros(X.shape); top_k=self.spec.top_k
+        flat=idx.reshape(-1); order=torch.argsort(flat,stable=True)
+        counts=torch.bincount(flat[order],minlength=p["router"].shape[1]); start=0
+        for eid,cnt in enumerate(counts.tolist()):
+            if cnt==0: continue
+            pos=order[start:start+cnt]; start+=cnt
+            rows=pos//top_k; cols=pos%top_k
             if self.store is not None:self.store.pin(eid)
             try:
-                xb=X[rows]; yb=self._expert(xb,eid); wt=weights[rows,cols].unsqueeze(1)
-                Y=Y.index_add(0,rows,wt*yb)
+                yb=self._expert(X[rows],eid); wt=weights[rows,cols].unsqueeze(1)
+                Y.index_add_(0,rows,wt*yb)
             finally:
                 if self.store is not None:self.store.unpin(eid)
         return Y,info
@@ -240,9 +247,9 @@ class Model(nn.Module):
         for (eid,suffix),leaf in self._paged_leaves.items():
             target=p[f"expert.{eid}.{suffix}"]
             if leaf.grad is not None:
-                if target.grad is None: target.grad=leaf.grad.detach().clone()
+                if target.grad is None: target.grad=leaf.grad.detach()
                 else: target.grad.add_(leaf.grad.detach())
-        grads={k:v.grad.detach().clone() for k,v in p.items() if v.grad is not None}
+        grads={k:v.grad.detach() for k,v in p.items() if v.grad is not None}
         out=float(loss.detach().item()); aux=dict(self._last_aux); self.zero_grad(set_to_none=True)
         return out,grads,aux
 
