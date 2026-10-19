@@ -438,10 +438,12 @@ extern "C" int smaulbrain_recurrent_scan(
 
 extern "C" int smaulbrain_recurrent_backward_scan(
     const float* dS, const float* S, const float* alpha, float* dKV,
-    double* dalpha, std::size_t T, std::size_t d) {
+    double* dalpha, const float* s0, std::size_t T, std::size_t d) {
     if (!dS || !S || !alpha || !dKV || !dalpha || d == 0) return 1;
     // Use double recurrent accumulators to match the stable Python reference,
     // but keep all per-timestep loops inside native code instead of Python.
+    // s0 is the scan's initial state: dalpha needs it because s_0 depends on
+    // alpha through s_0 = alpha*s0 + kv_0. NULL means a zero initial state.
     std::vector<double> ds(d, 0.0);
     std::vector<double> dsdalpha(d, 0.0);
     std::vector<double> da(d, 0.0);
@@ -457,7 +459,8 @@ extern "C" int smaulbrain_recurrent_backward_scan(
         const std::size_t base = t * d;
         const std::size_t prev = t > 0 ? (t - 1) * d : 0;
         for (std::size_t j = 0; j < d; ++j) {
-            const double s_prev = t > 0 ? static_cast<double>(S[prev + j]) : 0.0;
+            const double s_prev = t > 0 ? static_cast<double>(S[prev + j])
+                                        : (s0 ? static_cast<double>(s0[j]) : 0.0);
             dsdalpha[j] = s_prev + static_cast<double>(alpha[j]) * dsdalpha[j];
             da[j] += static_cast<double>(dS[base + j]) * dsdalpha[j];
         }

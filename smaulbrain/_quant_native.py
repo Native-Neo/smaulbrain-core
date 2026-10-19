@@ -258,7 +258,7 @@ def prepare_ternary_backend() -> bool:
         lib.smaulbrain_recurrent_scan.restype = ctypes.c_int
         ptr_f64 = ctypes.POINTER(ctypes.c_double)
         lib.smaulbrain_recurrent_backward_scan.argtypes = [
-            ptr_f32, ptr_f32, ptr_f32, ptr_f32, ptr_f64,
+            ptr_f32, ptr_f32, ptr_f32, ptr_f32, ptr_f64, ptr_f32,
             ctypes.c_size_t, ctypes.c_size_t]
         lib.smaulbrain_recurrent_backward_scan.restype = ctypes.c_int
         _NATIVE_LIB = lib
@@ -304,12 +304,17 @@ def recurrent_scan(kv: np.ndarray, alpha: np.ndarray, state: np.ndarray,
 
 def recurrent_backward_scan(dS: np.ndarray, states: np.ndarray,
                             alpha: np.ndarray, dKV: np.ndarray,
-                            dalpha: np.ndarray) -> bool:
+                            dalpha: np.ndarray,
+                            s0: np.ndarray | None = None) -> bool:
     """Run native recurrent BPTT scans when the C++ backend is already loaded.
 
     Buffers must be preallocated contiguous arrays with float32 activations and
     a float64 dalpha accumulator. Returns False without modifying them if no
     native backend is loaded or conversion would be required.
+
+    `s0` is the initial state the forward scan started from. The gradient of
+    `alpha` depends on it because s_0 = alpha*s0 + kv_0; when omitted, the
+    initial state is treated as zero (the training default).
     """
     if _NATIVE_LIB is None:
         return False
@@ -324,6 +329,9 @@ def recurrent_backward_scan(dS: np.ndarray, states: np.ndarray,
     T, d = dS.shape
     if alpha.shape != (d,) or dalpha.shape != (d,):
         raise ValueError("recurrent backward alpha/dalpha widths must match activations")
+    if s0 is not None and (not isinstance(s0, np.ndarray) or s0.dtype != np.float32
+                           or not s0.flags.c_contiguous or s0.shape != (d,)):
+        raise ValueError("recurrent backward initial state must be a contiguous float32 (d,) array")
     if T == 0:
         dalpha.fill(0.0)
         return True
@@ -335,6 +343,7 @@ def recurrent_backward_scan(dS: np.ndarray, states: np.ndarray,
         alpha.ctypes.data_as(ctypes.POINTER(ctypes.c_float)),
         dKV.ctypes.data_as(ctypes.POINTER(ctypes.c_float)),
         dalpha.ctypes.data_as(ctypes.POINTER(ctypes.c_double)),
+        None if s0 is None else s0.ctypes.data_as(ctypes.POINTER(ctypes.c_float)),
         T, d)
     if status != 0:
         raise RuntimeError(f"native recurrent backward scan failed with status {status}")
