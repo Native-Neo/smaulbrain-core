@@ -341,6 +341,8 @@ class Trainer:
             if log_every and steps % log_every == 0:
                 self.log.append({"step": self.sched.global_step, "loss": loss,
                                  "smooth": self.sched.smooth_loss,
+                                 "loss_main": float(info.get("loss_main", loss)),
+                                 "mtp_losses": list(info.get("mtp_losses", [])),
                                  "overflow_dropped": int(info.get("overflow_dropped", 0))})
             if ckpt_every and self.sched.global_step % ckpt_every == 0:
                 self.save()
