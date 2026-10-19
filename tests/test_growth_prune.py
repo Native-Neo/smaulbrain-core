@@ -135,7 +135,7 @@ def test_growth_event_router_resize_and_candidate_repro(tmp_path):
         else:
             ref_state[k] = {sk: (sv.clone() if isinstance(sv, torch.Tensor) else sv)
                             for sk, sv in s.items()}
-    ref.load_state_dict(ref_state, {k: True for k in ref_state})
+    ref.load_state_dict(ref_state, {k: ("R" in ref_state[k]) for k in ref_state})
     for k, s in ref.state.items():
         for sk, sv in s.items():
             if isinstance(sv, torch.Tensor):
