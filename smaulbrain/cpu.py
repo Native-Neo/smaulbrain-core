@@ -23,13 +23,17 @@ def detect() -> dict:
             text = f.read().lower()
         flags = set()
         for line in text.splitlines():
-            if line.startswith("flags"):
-                flags.update(line.split(":")[1].split())
+            if not line.startswith("flags"):
+                continue
+            parts = line.split(":", 1)
+            if len(parts) < 2:
+                continue
+            flags.update(parts[1].split())
         info["has_avx"] = "avx" in flags
         info["has_avx2"] = "avx2" in flags
         info["has_avx512"] = any(x in flags for x in ("avx512f", "avx512bw", "avx512vl"))
         info["has_sse2"] = "sse2" in flags
-    except (OSError, IndexError, ValueError):
+    except OSError:
         pass
     return info
 
