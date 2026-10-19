@@ -1,6 +1,7 @@
-// SmaulBRAIN V2 portable native kernels (scalar C++; no AVX2/AVX-512 required).
-// Build: python -m v2.kernels.build   (explicit, actionable errors on failure)
-// All ops have Python scalar references in smaulbrain/math_ref.py; parity tested.
+// SmaulBRAIN portable native kernels (scalar C++; no AVX2/AVX-512 required).
+// Build: python -c "from smaulbrain.kernels import build_here; build_here()"
+// References: math_ref.py (rmsnorm, recurrent step) and _quant_native.py
+// (ternary packing, packed matvec); parity is tested.
 #include <cmath>
 #include <cstdint>
 
