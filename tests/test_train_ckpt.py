@@ -515,6 +515,25 @@ def test_training_manifest_preserves_corpus_source(tmp_path):
                            "sha256": stream.sha256}
 
 
+def test_trainer_resume_rejects_changed_corpus(tmp_path):
+    corpus_path = tmp_path / "training.bin"
+    corpus_path.write_bytes(b"training corpus bytes")
+    checkpoint = tmp_path / "checkpoint"
+    original = TL.Trainer(
+        cfg.PRESETS["dense-tiny"],
+        make_args(checkpoint, preset="dense-tiny"),
+        D.ByteStream(path=str(corpus_path)))
+    original.save()
+    corpus_path.write_bytes(b"TRAINING corpus bytes")
+
+    resumed = TL.Trainer(
+        cfg.PRESETS["dense-tiny"],
+        make_args(checkpoint, preset="dense-tiny"),
+        D.ByteStream(path=str(corpus_path)))
+    with pytest.raises(ValueError, match="dataset mismatch"):
+        resumed.load(checkpoint)
+
+
 def test_bytestream_and_synth_bytes_edges(tmp_path):
     with pytest.raises(ValueError, match="needs path or data"):
         D.ByteStream()
