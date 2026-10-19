@@ -32,6 +32,11 @@ def add_common_args(ap: argparse.ArgumentParser, need_train: bool = False):
                     help="Gaussian mutation sigma as fraction of source RMS")
     ap.add_argument("--growth-seed", type=int, default=None)
     ap.add_argument("--expert-capacity-factor", type=float, default=1.25)
+    ap.add_argument("--mtp-depth", default="2",
+                    help="multi-token prediction depth (0 disables; each depth "
+                         "adds a shared V3-style module predicting one more token)")
+    ap.add_argument("--mtp-loss-weight", default="0.1",
+                    help="weight applied to every MTP depth's cross-entropy")
     if need_train:
         ap.add_argument("--max-steps", type=int, default=50)
         ap.add_argument("--corpus", default=None, help="path to raw byte corpus")
@@ -50,4 +55,6 @@ def validate_args(args) -> str:
         raise ValueError("--paging-cache-experts must be >= 1")
     if args.expert_capacity_factor <= 0:
         raise ValueError("--expert-capacity-factor must be > 0")
+    args.mtp_depth = _cfg.parse_mtp_depth(args.mtp_depth)
+    args.mtp_loss_weight = _cfg.parse_mtp_loss_weight(args.mtp_loss_weight)
     return preset
