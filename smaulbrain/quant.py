@@ -61,9 +61,8 @@ def pack_ternary_tiled(W):
 
 
 def unpack_codes(packed, shape):
-    p = packed.buf if isinstance(packed, TiledPacked) else packed
-    if isinstance(p, torch.Tensor): p = _np(p, torch.uint8)
-    return torch.from_numpy(_native.unpack_codes(p, shape).copy())
+    if isinstance(packed, torch.Tensor): packed = _np(packed, torch.uint8)
+    return torch.from_numpy(_native.unpack_codes(packed, shape).copy())
 
 
 def unpack_ternary(packed, shape, scale):
@@ -75,30 +74,38 @@ def packed_matvec_scalar(x, packed, shape, scale):
 
 
 def packed_matmat_scalar(X, packed, shape, scale):
-    p = packed.buf if isinstance(packed, TiledPacked) else packed
-    if isinstance(p, torch.Tensor): p = _np(p, torch.uint8)
+    p = _kernel_pack(packed)
     x = _tensor(X).detach().cpu().contiguous().numpy()
     return torch.from_numpy(_native.packed_matmat_scalar(x, p, shape, scale).copy()).to(_tensor(X).device)
+
+
+def _kernel_pack(packed):
+    """Native kernel view of a packed buffer: tiled packs stay typed so the
+    native dispatcher can pick the tiled kernels instead of reading the tile
+    layout as if it were row-major 2-bit codes."""
+    if isinstance(packed, TiledPacked):
+        return packed
+    if isinstance(packed, torch.Tensor):
+        return _np(packed, torch.uint8)
+    return packed
 
 
 def packed_matmat(X, packed, shape, scale, allow_dense_reconstruction=False):
     if allow_dense_reconstruction:
         raise RuntimeError("forbidden path: dense ternary reconstruction is not allowed")
     x = _tensor(X)
-    p = packed.buf if isinstance(packed, TiledPacked) else packed
-    if isinstance(p, torch.Tensor): p = _np(p, torch.uint8)
+    p = _kernel_pack(packed)
     if x.device.type == "cpu":
         y = _native.packed_matmat(_np(x), p, shape, scale, False)
         return torch.from_numpy(y.copy()).to(dtype=x.dtype)
     # Accelerator fallback: decode only to signed ternary codes for the matmul;
     # no latent FP32/FP8 master weight is reconstructed or cached.
-    codes = unpack_codes(p, shape).to(device=x.device, dtype=torch.int8)
+    codes = unpack_codes(packed, shape).to(device=x.device, dtype=torch.int8)
     return (x @ codes.to(x.dtype)) * float(scale)
 
 
 def packed_matmat_transpose_scalar(dY, packed, shape, scale):
-    p = packed.buf if isinstance(packed, TiledPacked) else packed
-    if isinstance(p, torch.Tensor): p = _np(p, torch.uint8)
+    p = _kernel_pack(packed)
     dy = _np(_tensor(dY))
     out = _native.packed_matmat_transpose_scalar(dy, p, shape, scale)
     return torch.from_numpy(out.copy()).to(_tensor(dY).device)
@@ -106,12 +113,11 @@ def packed_matmat_transpose_scalar(dY, packed, shape, scale):
 
 def packed_matmat_transpose(dY, packed, shape, scale):
     dy = _tensor(dY)
-    p = packed.buf if isinstance(packed, TiledPacked) else packed
-    if isinstance(p, torch.Tensor): p = _np(p, torch.uint8)
+    p = _kernel_pack(packed)
     if dy.device.type == "cpu":
         out = _native.packed_matmat_transpose(_np(dy), p, shape, scale)
         return torch.from_numpy(out.copy()).to(dtype=dy.dtype)
-    codes = unpack_codes(p, shape).to(device=dy.device, dtype=torch.int8)
+    codes = unpack_codes(packed, shape).to(device=dy.device, dtype=torch.int8)
     return (dy @ codes.to(dy.dtype).T) * float(scale)
 
 

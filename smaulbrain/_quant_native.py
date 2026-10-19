@@ -125,10 +125,42 @@ def pack_ternary_tiled(W: np.ndarray):
     return packed, scale, shape, th
 
 
-def unpack_codes(packed: np.ndarray, shape) -> np.ndarray:
+def _untile_rowmajor(buf: np.ndarray, shape) -> np.ndarray:
+    """Canonical row-major 2-bit bytes for the tile-contiguous native layout.
+
+    Tile t stores, for every input row, the 4 bytes covering output columns
+    16t..16t+15; columns of the last tile beyond d_out are zero-weight padding
+    (code 1) and are dropped here.
+    """
+    d_in, d_out = int(shape[0]), int(shape[1])
+    if d_in < 1 or d_out < 1:
+        raise ValueError(f"invalid packed matrix shape {shape}")
+    ntiles = (d_out + 15) // 16
+    b = np.asarray(buf, dtype=np.uint8).reshape(-1)
+    need = ntiles * d_in * 4
+    if b.size < need:
+        raise ValueError(f"tiled buffer has {b.size} bytes, needs at least {need}")
+    lanes = (b[:need].reshape(ntiles, d_in, 4)[:, :, :, None] >> (2 * np.arange(4))) & 3
+    codes = lanes.reshape(ntiles, d_in, 16).transpose(1, 0, 2).reshape(d_in, ntiles * 16)
+    flat = codes[:, :d_out].reshape(-1).astype(np.uint8)
+    pad = (-flat.size) % 4
+    if pad:
+        flat = np.concatenate([flat, np.ones(pad, dtype=np.uint8)])
+    q4 = flat.reshape(-1, 4)
+    return (q4[:, 0] | (q4[:, 1] << 2) | (q4[:, 2] << 4) | (q4[:, 3] << 6)).astype(np.uint8)
+
+
+def _rowmajor_bytes(packed, shape) -> np.ndarray:
+    """Canonical row-major 2-bit bytes for either packed representation."""
+    if isinstance(packed, TiledPacked):
+        return _untile_rowmajor(packed.buf, shape)
+    return np.asarray(packed, dtype=np.uint8)
+
+
+def unpack_codes(packed, shape) -> np.ndarray:
     """Unpack to int8 codes {-1,0,+1} (NOT a dense fp32 reconstruction)."""
     n = int(np.prod(shape))
-    b = np.asarray(packed, dtype=np.uint8)
+    b = _rowmajor_bytes(packed, shape).reshape(-1)
     codes = np.empty(b.size * 4, dtype=np.int8)
     codes[0::4] = (b & 0x3).astype(np.int8) - 1
     codes[1::4] = ((b >> 2) & 0x3).astype(np.int8) - 1
@@ -141,13 +173,13 @@ def unpack_ternary(packed: np.ndarray, shape, scale: float):
     return (unpack_codes(packed, shape).astype(np.float32) * np.float32(scale))
 
 
-def packed_matvec_scalar(x: np.ndarray, packed: np.ndarray, shape, scale: float) -> np.ndarray:
+def packed_matvec_scalar(x: np.ndarray, packed, shape, scale: float) -> np.ndarray:
     """Scalar reference: y = x @ W_q * scale, decoding each trit in place."""
     d_in, d_out = shape
     x = np.asarray(x, dtype=np.float32).reshape(-1)
     if x.size != d_in:
         raise ValueError(f"input width {x.size} does not match packed matrix width {d_in}")
-    packed = np.asarray(packed, dtype=np.uint8).reshape(-1)
+    packed = _rowmajor_bytes(packed, shape).reshape(-1)
     if packed.size < (d_in * d_out + 3) // 4:
         raise ValueError("packed ternary buffer is shorter than the declared shape")
     y = np.zeros(d_out, dtype=np.float64)
@@ -356,11 +388,11 @@ def ternary_backend_name() -> str:
     return f"native-cpp-packed-{_NATIVE_VARIANT}"
 
 
-def _check_packed_shape(packed: np.ndarray, shape):
+def _check_packed_shape(packed, shape):
     d_in, d_out = (int(shape[0]), int(shape[1]))
     if d_in < 1 or d_out < 1:
         raise ValueError(f"invalid packed matrix shape {shape}")
-    packed = np.ascontiguousarray(packed, dtype=np.uint8).reshape(-1)
+    packed = _rowmajor_bytes(packed, shape).reshape(-1)
     need = (d_in * d_out + 3) // 4
     if packed.size < need:
         raise ValueError(f"packed buffer has {packed.size} bytes, needs at least {need}")
@@ -393,7 +425,7 @@ def packed_matmat(X: np.ndarray, packed: np.ndarray, shape, scale: float,
         x = x.reshape(1, -1)
     if x.ndim != 2:
         raise ValueError("packed ternary matmat expects a 1-D or 2-D input")
-    if isinstance(packed, TiledPacked):
+    if isinstance(packed, TiledPacked) and _NATIVE_LIB is not None:
         d_in, d_out = int(shape[0]), int(shape[1])
         if x.shape[1] != d_in:
             raise ValueError(f"input width {x.shape[1]} does not match packed matrix width {d_in}")
@@ -469,7 +501,7 @@ def packed_matmat_transpose(dY: np.ndarray, packed: np.ndarray, shape,
         dy = dy.reshape(1, -1)
     if dy.ndim != 2:
         raise ValueError("packed ternary transpose matmat expects 1-D or 2-D input")
-    if isinstance(packed, TiledPacked):
+    if isinstance(packed, TiledPacked) and _NATIVE_LIB is not None:
         d_in, d_out = int(shape[0]), int(shape[1])
         if dy.shape[1] != d_out:
             raise ValueError(f"gradient width {dy.shape[1]} does not match packed output width {d_out}")
