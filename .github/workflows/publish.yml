@@ -14,7 +14,7 @@ on:
         options:
           - testpypi
           - pypi
-        default: testpypi
+        default: pypi
 
 permissions:
   contents: read
