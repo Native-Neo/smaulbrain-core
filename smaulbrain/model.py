@@ -89,6 +89,18 @@ class FP8Cache:
             for key in keys:self.d.pop(key,None)
 
 
+def _weight_grad(X, dY):
+    """dL/dW for matmul gradients, including 1-D (single row) inputs.
+
+    ``X.T @ dY`` degenerates to a dot/0-dim result when X is 1-D, which does
+    not match W's (d_in, d_out) shape; the outer product is the correct
+    gradient there.
+    """
+    if X.dim()==1: X=X.unsqueeze(0)
+    if dY.dim()==1: dY=dY.unsqueeze(0)
+    return X.T @ dY
+
+
 class _QuantLinear(torch.autograd.Function):
     @staticmethod
     def forward(ctx, X, W, Wq, kind, backward_mode, packed, scale, shape):
@@ -101,16 +113,16 @@ class _QuantLinear(torch.autograd.Function):
     @staticmethod
     def backward(ctx, dY):
         X,W,Wq=ctx.saved_tensors; kind=ctx.kind; mode=ctx.backward_mode
-        if kind == "fp32": return dY @ W.T, X.T @ dY, None, None, None, None, None, None
+        if kind == "fp32": return dY @ W.T, _weight_grad(X,dY), None, None, None, None, None, None
         if kind == "fp8":
             if mode == "fp8":
                 dYq,_=_quant.fp8_e4m3_quantize(dY); Xq,_=_quant.fp8_e4m3_quantize(X)
-                return dYq @ Wq.T, Xq.T @ dYq, None, None, None, None, None, None
-            return dY @ Wq.T, X.T @ dY, None, None, None, None, None, None
+                return dYq @ Wq.T, _weight_grad(Xq,dYq), None, None, None, None, None, None
+            return dY @ Wq.T, _weight_grad(X,dY), None, None, None, None, None, None
         dX=_quant.packed_matmat_transpose(dY,ctx.packed,ctx.shape,ctx.scale)
         if mode == "fp8":
-            dYq,_=_quant.fp8_e4m3_quantize(dY); Xq,_=_quant.fp8_e4m3_quantize(X); dW=Xq.T @ dYq
-        else: dW=X.T @ dY
+            dYq,_=_quant.fp8_e4m3_quantize(dY); Xq,_=_quant.fp8_e4m3_quantize(X); dW=_weight_grad(Xq,dYq)
+        else: dW=_weight_grad(X,dY)
         return dX,dW,None,None,None,None,None,None
 
 
