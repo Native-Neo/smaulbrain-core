@@ -30,7 +30,7 @@ class InferenceEngine:
         self.model=model;self.temperature=float(temperature);self.top_k=int(top_k);self.top_p=float(top_p)
         if not 0<self.top_p<=1:raise ValueError("--top-p must be in (0, 1]")
         if self.top_k<0:raise ValueError("--top-k must be >= 0")
-        if self.temperature<0:raise ValueError("--temperature must be >= 0")
+        if not self.temperature>=0:raise ValueError("--temperature must be >= 0")
         self.mtp_depth=int(getattr(model,"mtp_depth",0) or 0)
         self.speculative=int(speculative)
         if self.speculative<0:raise ValueError("speculative must be >= 0")
