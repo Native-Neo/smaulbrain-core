@@ -461,7 +461,10 @@ def test_bytestream_wrap_and_state_roundtrip(tmp_path):
     assert bs.cursor == SEQ_LEN + 1
 
     sd = bs.state_dict()
-    assert sd == {"cursor": bs.cursor, "path": str(p), "size": bs.size}
+    assert sd["cursor"] == bs.cursor
+    assert sd["path"] == str(p)
+    assert sd["size"] == bs.size
+    assert len(sd["sha256"]) == 64
 
     # wrap at the epoch boundary restarts at offset 0
     bs.cursor = bs.size - 3
@@ -475,6 +478,7 @@ def test_bytestream_wrap_and_state_roundtrip(tmp_path):
         bs.load_state_dict({"cursor": 0, "path": str(p) + "x", "size": bs.size})
     with pytest.raises(ValueError, match="dataset mismatch"):
         bs.load_state_dict({"cursor": 0, "path": str(p), "size": bs.size + 1})
+    bs.load_state_dict({"cursor": 0, "path": str(p), "size": bs.size})
 
     for cursor in (-1, bs.size + 1):
         with pytest.raises(ValueError, match="cursor"):
@@ -483,6 +487,18 @@ def test_bytestream_wrap_and_state_roundtrip(tmp_path):
     bs.close()
     with pytest.raises(ValueError, match="closed"):
         bs.next_tokens(SEQ_LEN)
+
+
+def test_bytestream_rejects_same_size_corpus_replacement(tmp_path):
+    p = tmp_path / "corpus.bin"
+    p.write_bytes(b"abcdefgh")
+    original = D.ByteStream(path=str(p))
+    state = original.state_dict()
+    p.write_bytes(b"abcdWXYZ")
+    replacement = D.ByteStream(path=str(p))
+
+    with pytest.raises(ValueError, match="dataset mismatch"):
+        replacement.load_state_dict(state)
 
 
 def test_bytestream_and_synth_bytes_edges(tmp_path):
