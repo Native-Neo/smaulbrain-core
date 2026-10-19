@@ -16,6 +16,10 @@ quantization, and a factored optimizer, on PyTorch.
 - **Crash-safe checkpoints**: atomic publish, sha256-verified payloads,
   `.bak` fallback recovery, and a two-phase growth protocol (pending, then
   committed) that resumes exactly.
+- File-backed training streams are SHA-256 fingerprinted at startup and saved
+  with checkpoint source metadata; resume checks content before continuing.
+  Older checkpoints remain loadable and validate only their recorded path and
+  size.
 - **Expert pruning** from checkpoints using held-out loss evidence.
 - **Multi-token prediction (MTP)**: DeepSeek-V3-style lightweight modules that
   predict several tokens ahead with the shared embedding/head, plus
