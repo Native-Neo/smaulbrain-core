@@ -52,6 +52,8 @@ def validate_args(args) -> str:
     _cfg.validate_quant_combo(args.forward_quant, args.backward_mode)
     args.growth_every_steps = _cfg.parse_growth_every_steps(args.growth_every_steps)
     args.growth_loss_nats = _cfg.parse_growth_loss_nats(args.growth_loss_nats)
+    if args.seq_len < 1:
+        raise ValueError("--seq-len must be >= 1")
     if args.paging_cache_experts < 1:
         raise ValueError("--paging-cache-experts must be >= 1")
     if args.expert_capacity_factor <= 0:
