@@ -205,6 +205,24 @@ def test_resume_restores_eval_stream_cursor_and_continuation(tmp_path):
     assert [h["id"] for h in t1.sched.history] == [h["id"] for h in t2.sched.history]
 
 
+def test_d2r_trainers_use_isolated_mirrors(tmp_path):
+    ck = tmp_path / "run"
+    t1 = build_trainer(ck, extra=["--paging", "D2R"])
+    t1.train(max_steps=3, log_every=1, ckpt_every=3)
+    p1 = tensors(t1.model.p)
+
+    t2 = build_trainer(ck, extra=["--paging", "D2R"])
+    t2.load(ck)
+    assert params_equal(p1, tensors(t2.model.p))
+
+    t1.train(max_steps=5, log_every=1)
+    t2.train(max_steps=5, log_every=1)
+    assert losses(t1, 2) == losses(t2, 2)
+    assert params_equal(tensors(t1.model.p), tensors(t2.model.p))
+    # each trainer owns its own disk mirror: no cross-instance corruption
+    assert t1.model.store.disk_dir != t2.model.store.disk_dir
+
+
 # ---------------------------------------------------------------- paging
 def test_paging_r_and_d2r_train_identically(tmp_path):
     tR = build_trainer(tmp_path / "r", extra=["--paging", "R"])

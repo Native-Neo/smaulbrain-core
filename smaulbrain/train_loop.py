@@ -8,8 +8,11 @@ After each successful optimizer update, in order:
   10. adopt candidate; 11. next update.
 """
 import os
+import shutil
 import time
 import math
+import tempfile
+import weakref
 import torch
 
 from . import checkpoint as _ckpt
@@ -54,7 +57,16 @@ class Trainer:
     def _live_experts_dir(self) -> str:
         # Live per-expert disk mirrors are transient and must not live inside
         # the published checkpoint tree, which _publish_dir replaces wholesale.
-        return os.path.normpath(self.args.checkpoint) + ".experts_live"
+        # Each trainer owns a unique mirror: sharing one directory lets a
+        # second trainer overwrite the first one's cached expert weights.
+        if getattr(self, "_live_dir", None) is None:
+            parent = os.path.dirname(os.path.abspath(self.args.checkpoint))
+            os.makedirs(parent, exist_ok=True)
+            self._live_dir = tempfile.mkdtemp(
+                prefix=os.path.basename(os.path.normpath(self.args.checkpoint)) + ".experts_live.",
+                dir=parent)
+            weakref.finalize(self, shutil.rmtree, self._live_dir, ignore_errors=True)
+        return self._live_dir
 
     def _make_store(self, mode, n_exp, params, disk_dir):
         if mode in ("R", "V", "R2V"):
