@@ -1,6 +1,6 @@
 """Scalar reference mathematics for SmaulBRAIN V2.
 
-Authoritative equations (also documented in docs/architecture.md):
+Authoritative scalar equations (optimized paths must match these):
 
 RMSNorm: y_i = x_i / sqrt(mean(x^2) + eps) * g_i ; g init ones, eps=1e-6.
 
