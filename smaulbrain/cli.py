@@ -32,10 +32,10 @@ def add_common_args(ap: argparse.ArgumentParser, need_train: bool = False):
                     help="Gaussian mutation sigma as fraction of source RMS")
     ap.add_argument("--growth-seed", type=int, default=None)
     ap.add_argument("--expert-capacity-factor", type=float, default=1.25)
-    ap.add_argument("--mtp-depth", default="60",
+    ap.add_argument("--mtp-depth", default="10",
                     help="multi-token prediction depth: depth k predicts k "
                          "tokens ahead (0 disables; each depth adds a shared "
-                         "V3-style module). Default 60.")
+                         "V3-style module). Default 10.")
     ap.add_argument("--mtp-loss-weight", default="0.1",
                     help="weight applied to every MTP depth's cross-entropy")
     if need_train:
