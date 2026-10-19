@@ -153,8 +153,10 @@ class Trainer:
             self.rng.set_state(torch.tensor(rng_state["torch_state"], dtype=torch.uint8))
         # Legacy NumPy RNG state is intentionally not replayed; resumed model and optimizer
         # tensors are exact, while newly introduced random experts use their recorded seed.
+        data_stream = ck_cfg.get("data_stream") or {}
         self.stream.load_state_dict({"cursor": man["data_cursor"], "path": self.stream.path,
-                                     "size": self.stream.size})
+                                     "size": self.stream.size,
+                                     "sha256": data_stream.get("sha256")})
         if self.eval_stream is not None and ck_cfg.get("eval_cursor") is not None:
             # Growth evidence must replay from the exact eval position, or the
             # resumed ranking (and therefore the grown model) can differ.
