@@ -31,8 +31,13 @@ class Router:
         idx = torch.argsort(scores, dim=1, descending=True, stable=True)[:, :top_k]
         top_scores = scores.gather(1, idx)
         raw_weights = torch.softmax(top_scores, dim=1)
-        T = X.shape[0]; cap = max(1, math.ceil(capacity_factor * T * top_k / self.n_experts))
+        T = X.shape[0]
         flat = idx.reshape(-1)
+        # capacity_factor=None disables capacity limiting. Speculative
+        # verification uses it: sequential single-token decoding never hits
+        # the per-expert cap (cap >= 1, one token contributes at most one hit
+        # per expert), so a batched no-drop pass reproduces it exactly.
+        cap = flat.numel() if capacity_factor is None else max(1, math.ceil(capacity_factor * T * top_k / self.n_experts))
         order = torch.argsort(flat, stable=True)
         sorted_flat = flat[order]
         counts = torch.bincount(sorted_flat, minlength=self.n_experts)
