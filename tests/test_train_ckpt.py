@@ -476,6 +476,10 @@ def test_bytestream_wrap_and_state_roundtrip(tmp_path):
     with pytest.raises(ValueError, match="dataset mismatch"):
         bs.load_state_dict({"cursor": 0, "path": str(p), "size": bs.size + 1})
 
+    for cursor in (-1, bs.size + 1):
+        with pytest.raises(ValueError, match="cursor"):
+            bs.load_state_dict({"cursor": cursor, "path": str(p), "size": bs.size})
+
     bs.close()
     with pytest.raises(ValueError, match="closed"):
         bs.next_tokens(SEQ_LEN)
