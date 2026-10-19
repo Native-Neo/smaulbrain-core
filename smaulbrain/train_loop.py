@@ -79,7 +79,9 @@ class Trainer:
                  "lr": self.args.lr, "seq_len": self.args.seq_len,
                  "capacity_factor": self.model.capacity_factor,
                  "mtp_depth": self.model.mtp_depth,
-                 "mtp_loss_weight": self.model.mtp_loss_weight}
+                 "mtp_loss_weight": self.model.mtp_loss_weight,
+                 "eval_cursor": (self.eval_stream.cursor
+                                 if self.eval_stream is not None else None)}
         factored = {k: bool(state["factored"]) for k, state in self.opt.state.items()}
         return _ckpt.build_manifest(
             self.spec.name, arch, extra, self.sched.to_record(),
@@ -137,6 +139,12 @@ class Trainer:
         # tensors are exact, while newly introduced random experts use their recorded seed.
         self.stream.load_state_dict({"cursor": man["data_cursor"], "path": self.stream.path,
                                      "size": self.stream.size})
+        if self.eval_stream is not None and ck_cfg.get("eval_cursor") is not None:
+            # Growth evidence must replay from the exact eval position, or the
+            # resumed ranking (and therefore the grown model) can differ.
+            self.eval_stream.load_state_dict({"cursor": int(ck_cfg["eval_cursor"]),
+                                              "path": self.eval_stream.path,
+                                              "size": self.eval_stream.size})
         if self.spec.kind == "moe":
             self.model.store = self._make_store(
                 self.args.paging, man["n_experts_current"], self.model.p, None)
