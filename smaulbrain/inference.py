@@ -258,12 +258,15 @@ class InferenceEngine:
             return out[k-2].get(j, self._ring_get(self._h[k-2],j))
         for k in range(1,K+1):
             rows=list(range(self._mtp_pos[k-1],pos+1))
+            if not rows:
+                break
             H=[];T=[];ready=True
             for j in rows:
                 hp=hprev_tent(k,j); tv=tok_tent(j+k)
                 if hp is None or tv is None: ready=False; break
                 H.append(hp);T.append(tv)
-            if not ready: break
+            if not ready or not H:
+                break
             logits,Y,_s=self.model._mtp_module(k,torch.stack(H),
                                                torch.tensor(T,dtype=torch.long),
                                                state=self._mtp_states[k-1])
