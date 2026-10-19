@@ -501,6 +501,20 @@ def test_bytestream_rejects_same_size_corpus_replacement(tmp_path):
         replacement.load_state_dict(state)
 
 
+def test_training_manifest_preserves_corpus_source(tmp_path):
+    corpus_path = tmp_path / "training.bin"
+    corpus_path.write_bytes(b"training corpus bytes")
+    stream = D.ByteStream(path=str(corpus_path))
+    trainer = TL.Trainer(cfg.PRESETS["dense-tiny"],
+                         make_args(tmp_path / "checkpoint", preset="dense-tiny"),
+                         stream)
+
+    data_stream = trainer._build_manifest(trainer.model.p)["config"]["data_stream"]
+    assert data_stream == {"kind": "file", "path": str(corpus_path),
+                           "size": len(b"training corpus bytes"),
+                           "sha256": stream.sha256}
+
+
 def test_bytestream_and_synth_bytes_edges(tmp_path):
     with pytest.raises(ValueError, match="needs path or data"):
         D.ByteStream()
