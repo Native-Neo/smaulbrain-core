@@ -32,11 +32,14 @@ class Trainer:
         self.eval_stream = eval_stream
         self.rng = torch.Generator(device="cpu").manual_seed(int(args.seed))
         n_exp = spec.n_experts_init if spec.kind == "moe" else 0
-        params = _model.build_params(spec, self.rng, n_exp, device=getattr(args, "device", "cpu"))
+        params = _model.build_params(spec, self.rng, n_exp, device=getattr(args, "device", "cpu"),
+                                     mtp_depth=getattr(args, "mtp_depth", 0))
         self.model = _model.Model(spec, params, forward_quant=args.forward_quant,
                                   backward_mode=args.backward_mode, paging_mode=args.paging,
                                   paging_store=None, capacity_factor=args.expert_capacity_factor,
-                                  device=getattr(args, "device", "cpu"))
+                                  device=getattr(args, "device", "cpu"),
+                                  mtp_depth=getattr(args, "mtp_depth", 0),
+                                  mtp_loss_weight=getattr(args, "mtp_loss_weight", 0.1))
         if spec.kind == "moe":
             self.model.store = self._make_store(args.paging, n_exp, self.model.p, None)
         self.opt = _opt.SmaulOPT(lr=args.lr, beta1=args.beta1, beta2=args.beta2,
@@ -69,12 +72,14 @@ class Trainer:
     # -- checkpoint payload --
     def _build_manifest(self, params):
         n_exp = len(_model.expert_ids(params)) if self.spec.kind == "moe" else 0
-        arch = _cfg.arch_report(self.spec, n_exp)
+        arch = _cfg.arch_report(self.spec, n_exp, mtp_depth=self.model.mtp_depth)
         extra = {"forward_quant": self.model.forward_quant,
                  "backward_mode": self.model.backward_mode,
                  "paging": self.args.paging, "seed": self.args.seed,
                  "lr": self.args.lr, "seq_len": self.args.seq_len,
-                 "capacity_factor": self.model.capacity_factor}
+                 "capacity_factor": self.model.capacity_factor,
+                 "mtp_depth": self.model.mtp_depth,
+                 "mtp_loss_weight": self.model.mtp_loss_weight}
         factored = {k: bool(state["factored"]) for k, state in self.opt.state.items()}
         return _ckpt.build_manifest(
             self.spec.name, arch, extra, self.sched.to_record(),
@@ -103,7 +108,18 @@ class Trainer:
         man = blob["manifest"]
         if man["preset"] != self.spec.name:
             raise ValueError(f"checkpoint preset {man['preset']} != {self.spec.name}")
+        ck_cfg = man.get("config", {}) or {}
+        ck_mtp = int(ck_cfg.get("mtp_depth", 0))
+        if ck_mtp != self.model.mtp_depth:
+            # The checkpoint owns the architecture: old (pre-MTP) checkpoints
+            # resume with mtp_depth=0 instead of failing the exact-count check.
+            self.log.append({"event": "mtp-config-adopted",
+                             "checkpoint_depth": ck_mtp,
+                             "requested_depth": self.model.mtp_depth})
+            self.model.mtp_depth = ck_mtp
+        self.model.mtp_loss_weight = float(ck_cfg.get("mtp_loss_weight", self.model.mtp_loss_weight))
         self.model.p = blob["params"]
+        self.model._assert_counts()
         self.model.packed.invalidate()
         self.model.fp8.invalidate()
         flags = man.get("optimizer", {}).get("factored", {})
@@ -201,7 +217,9 @@ class Trainer:
                              forward_quant=self.model.forward_quant,
                              backward_mode=self.model.backward_mode,
                              paging_mode="R", paging_store=None,
-                             capacity_factor=self.model.capacity_factor)
+                             capacity_factor=self.model.capacity_factor,
+                             mtp_depth=self.model.mtp_depth,
+                             mtp_loss_weight=self.model.mtp_loss_weight)
         toks = self._eval_batches(n_batches=1)[0]
         logits, _ = probe.forward(toks, train=False)
         if not torch.isfinite(logits).all().item():
@@ -303,7 +321,9 @@ class Trainer:
             reason = self.sched.note_optimizer_step(loss)
             self.last_metrics = {"step": self.sched.global_step, "loss": float(loss),
                                  "smooth_loss": self.sched.smooth_loss,
-                                 "overflow_dropped": int(info.get("overflow_dropped", 0))}
+                                 "overflow_dropped": int(info.get("overflow_dropped", 0)),
+                                 "loss_main": float(info.get("loss_main", loss)),
+                                 "mtp_losses": list(info.get("mtp_losses", []))}
             if reason is not None and self.sched.pending is None:
                 if self.spec.kind != "moe":
                     self.log.append({"event": "growth-skipped-dense",
