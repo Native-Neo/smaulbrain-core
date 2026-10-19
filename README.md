@@ -90,12 +90,12 @@ print(engine.generate([65, 66, 67], max_new_tokens=16))
 
 ## Multi-token prediction (MTP)
 
-`--mtp-depth K` (default 60) adds K shared modules on top of the main model.
+`--mtp-depth K` (default 10) adds K shared modules on top of the main model.
 Depth k predicts `tok[i+k+1]` from the main hidden at position `i` and the
 embedding of `tok[i+k]`, using a 2d->d projection, a recurrent-attention block
 and the tied embedding/head (DeepSeek-V3 style, no stop-gradient). With
-`K=60`, one hidden state at position `i` is trained to predict the next 60
-tokens, one depth per step ahead:
+`K=10`, one hidden state at position `i` is trained to predict the next 10
+tokens, one depth per step ahead (any depth works; 60+ is supported):
 
 ```
 loss = CE(main) + Σ_k  mtp_loss_weight * CE(depth k)      # default weight 0.1
@@ -104,7 +104,8 @@ loss = CE(main) + Σ_k  mtp_loss_weight * CE(depth k)      # default weight 0.1
 Deep chains add one small module per depth (roughly `6d²+6d` params each) and
 one sequential module forward per training step, so they cost more than they
 change the main loss; lower `--mtp-loss-weight` if the aggregate auxiliary
-term (`K * weight`, 6.0 at depth 60 with the default) crowds the main loss.
+term (`K * weight`, 1.0 at the default 10, 6.0 at depth 60) crowds the main
+loss.
 
 - MTP params are shared across experts, so growth/pruning/paging are
   unaffected; they are saved/loaded like every other parameter.
@@ -138,7 +139,7 @@ the matching prefix:
 - Cost grows quadratically with the draft depth (each round re-extends every
   depth from its verified position, about `K²/2` module rows for K drafts),
   so `speculative` around 8-16 is the practical sweet spot on CPU; large K
-  (up to the model depth, 60 by default) trades speed for maximum lookahead.
+  (up to the model depth, 10 by default) trades speed for maximum lookahead.
 
 
 ## Quantization modes
