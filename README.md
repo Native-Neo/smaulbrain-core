@@ -17,6 +17,10 @@ quantization, and a factored optimizer, on PyTorch.
   `.bak` fallback recovery, and a two-phase growth protocol (pending, then
   committed) that resumes exactly.
 - **Expert pruning** from checkpoints using held-out loss evidence.
+- **Multi-token prediction (MTP)**: DeepSeek-V3-style lightweight modules that
+  predict several tokens ahead with the shared embedding/head, plus
+  **speculative decoding** that drafts with MTP and verifies in one batched
+  forward (greedy output is token-identical to plain decoding).
 
 ## Presets
 
@@ -26,6 +30,10 @@ quantization, and a factored optimizer, on PyTorch.
 | dense-full | dense | 1000    | 19     | 256,000,000     |
 | moe-tiny   | moe   | 64      | 4      | 412,928 (32 experts, top-2) |
 | moe-full   | moe   | 512     | 6      | 334,149,632 (64 experts, top-8) |
+
+Parameter counts above are with `--mtp-depth 0`. Each enabled MTP depth adds
+`6*d_model^2 + 6*d_model` shared params: 6,336 per depth for dense-tiny,
+1,575,936 per depth for moe-full.
 
 ## Install
 
@@ -76,9 +84,49 @@ trainer.load("checkpoints/run")                        # exact resume
 from smaulbrain import prune_cmd, inference
 prune_cmd.prune_checkpoint("checkpoints/run", rm_worst=2, eval_batches=[tokens],
                            min_samples=256, assume_yes=True)
-engine = inference.InferenceEngine(trainer.model, temperature=0.0)
+engine = inference.InferenceEngine(trainer.model, temperature=0.0, speculative=2)
 print(engine.generate([65, 66, 67], max_new_tokens=16))
 ```
+
+## Multi-token prediction (MTP)
+
+`--mtp-depth K` (default 2) adds K shared modules on top of the main model.
+Depth k predicts `tok[i+k+1]` from the main hidden at position `i` and the
+embedding of `tok[i+k]`, using a 2d->d projection, a recurrent-attention block
+and the tied embedding/head (DeepSeek-V3 style, no stop-gradient):
+
+```
+loss = CE(main) + Σ_k  mtp_loss_weight * CE(depth k)      # default weight 0.1
+```
+
+- MTP params are shared across experts, so growth/pruning/paging are
+  unaffected; they are saved/loaded like every other parameter.
+- The checkpoint owns the architecture: loading an older (pre-MTP) checkpoint
+  resumes with `mtp_depth=0` instead of failing the exact-count check, and a
+  checkpoint's depth/weight override the command line on resume.
+- `mtp_param_count(spec, depth)` and the `mtp_depth`/`mtp_params` fields of
+  `arch_report()` report the extra capacity.
+
+## Speculative decoding
+
+`InferenceEngine(model, speculative=K)` drafts up to K tokens with the MTP
+modules, verifies them with a single batched main-model forward, and accepts
+the matching prefix:
+
+- `temperature=0`: greedy output is token-identical to plain decoding (the
+  verifier scores every position with the exact single-token math, and
+  capacity limiting is disabled because sequential decoding never drops
+  tokens).
+- `temperature>0`: drafts are accepted with the standard `min(1, p/q)` rule
+  and rejects are resampled from the normalized residual `(p-q)+`, so the
+  emitted distribution is unchanged.
+- Draft-module states are advanced only over verified tokens (never polluted
+  by rejected drafts); `export_states()`/`import_states()` carry the draft
+  pipeline along when it exists, so greedy generation resumes exactly.
+- The state-safe drafting horizon is two tokens (`engine.draft_depth`), since
+  depth-k state at position `i` depends on `tok[i+k]`; deeper trained modules
+  are still used for their loss but not for drafting.
+
 
 ## Quantization modes
 
