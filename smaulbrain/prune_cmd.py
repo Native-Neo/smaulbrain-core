@@ -29,9 +29,11 @@ def prune_checkpoint(ckpt_dir: str, rm_worst: int, eval_batches, min_samples: in
     spec = _cfg.PRESETS[man["preset"]]
     params = blob["params"]
     eids = _model.expert_ids(params)
+    mtp_depth = int(man.get("config", {}).get("mtp_depth", 0))
     # quality evidence from current model
     m = _model.Model(spec, params, forward_quant=man["config"].get("forward_quant", "fp32"),
-                     backward_mode=man["config"].get("backward_mode", "fp32"))
+                     backward_mode=man["config"].get("backward_mode", "fp32"),
+                     mtp_depth=mtp_depth)
     scores, nsamp = _growth.rank_experts(m, eval_batches, min_samples)
     if scores is None:
         raise RuntimeError(f"insufficient quality evidence ({nsamp} < {min_samples}); "
@@ -68,14 +70,14 @@ def prune_checkpoint(ckpt_dir: str, rm_worst: int, eval_batches, min_samples: in
     man2 = dict(man)
     man2["n_experts_current"] = len(keep)
     man2["expert_registry"] = list(range(len(keep)))
-    man2["arch"] = _cfg.arch_report(spec, len(keep))
+    man2["arch"] = _cfg.arch_report(spec, len(keep), mtp_depth=mtp_depth)
     man2.setdefault("prune_history", []).append(
         {"removed": victims, "scores": {str(v): scores[v] for v in victims},
          "prev_count": len(eids), "new_count": len(keep)})
     renamed.pop("router", None)  # shape-bound; re-initialized on load
     _ckpt.save_checkpoint(ckpt_dir, man2, new_params, renamed)
     blob2 = _ckpt.load_checkpoint(ckpt_dir)
-    m2 = _model.Model(spec, blob2["params"])
+    m2 = _model.Model(spec, blob2["params"], mtp_depth=mtp_depth)
     logits, _ = m2.forward([65, 66, 67, 68], train=False)
     if not torch.isfinite(logits).all().item():
         raise RuntimeError("pruned model failed validation")
