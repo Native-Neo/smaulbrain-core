@@ -54,7 +54,8 @@ class InferenceEngine:
                          "h0":[[int(p),v.tolist()] for p,v in self._h0 if p>=base],
                          "h":[[[int(p),v.tolist()] for p,v in ring if p>=base] for ring in self._h],
                          "states":[None if s is None else s.tolist() for s in self._mtp_states],
-                         "pos":list(self._mtp_pos)}
+                         "pos":list(self._mtp_pos),
+                         "unconsumed":bool(self._unconsumed)}
         return blob
 
     def import_states(self,blob):
@@ -72,7 +73,19 @@ class InferenceEngine:
         self._h=[[(int(p),torch.as_tensor(v,dtype=torch.float32)) for p,v in ring] for ring in mtp["h"]]
         self._mtp_states=[None if s is None else torch.as_tensor(s,dtype=torch.float32) for s in mtp["states"]]
         self._mtp_pos=[int(p) for p in mtp["pos"]]
-        self._unconsumed=True
+        # Blob and engine may use different draft depths: missing depths start
+        # fresh but positioned at the blob's deepest verified frontier (their
+        # inputs are only recorded from `base` on), and depths the importer
+        # does not use are dropped so the pipeline lists keep draft_depth rows.
+        pad=self._mtp_pos[-1] if self._mtp_pos else 0
+        k=self.draft_depth
+        self._mtp_states=(self._mtp_states+[None]*k)[:k]
+        self._h=(self._h+[[] for _ in range(k)])[:k]
+        self._mtp_pos=(self._mtp_pos+[pad]*k)[:k]
+        # `unconsumed` records whether the last recorded token still awaits its
+        # model step; blobs without it come from engines that always resumed as
+        # if it were true.
+        self._unconsumed=bool(mtp.get("unconsumed",True))
 
     def _reset_mtp(self):
         k=self.draft_depth
@@ -135,6 +148,16 @@ class InferenceEngine:
 
     def prefill(self,tokens,chunk=0):
         toks=list(tokens)
+        if not toks:
+            # Nothing to consume: an empty prefill must not clear the pending-token
+            # flag, or the next resume appends a duplicate token record at the
+            # frontier and the MTP catch-up stops forever.
+            return self.states
+        if not self._mtp_ready and self.draft_depth>0:
+            # A blob without a draft pipeline left the engine on the plain path;
+            # a fresh prefill starts a new session, so re-enable drafting (as the
+            # import_states comment promises).
+            self._reset_mtp()
         if not self._mtp_ready:
             if chunk and chunk>0:
                 for i in range(0,len(toks),chunk):self.model.forward(toks[i:i+chunk],states=self.states)
