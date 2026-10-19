@@ -4,6 +4,7 @@ Portable scalar C++ only (no AVX2/AVX-512 intrinsics anywhere). If a compiler
 or build fails, the error is explicit and actionable; the Python scalar/numpy
 reference path always remains available.
 """
+import errno
 import os
 import sys
 from functools import lru_cache
@@ -58,7 +59,14 @@ def build_here(build_dir="", verbose: bool = True) -> str:
             if result.returncode != 0:
                 raise RuntimeError(
                     result.stderr.strip() or "native C++ kernel compilation failed")
-            os.replace(temporary, target)
+            try:
+                os.replace(temporary, target)
+            except OSError as exc:
+                if exc.errno != errno.EXDEV:
+                    raise
+                # A scratch dir on another filesystem cannot be renamed into
+                # place; publish with a copy instead.
+                shutil.move(str(temporary), str(target))
         else:
             temporary.unlink(missing_ok=True)
     except BaseException:
@@ -79,8 +87,11 @@ def try_load():
     try:
         import ctypes
         import glob
-        cands = glob.glob(os.path.join(os.path.dirname(os.path.abspath(__file__)),
-                                       "smaul_kernels*"))
+        # Partial builds publish "<name>.so.<pid>.<rand>.tmp.so"; never let
+        # those shadow a complete library.
+        cands = [p for p in glob.glob(os.path.join(
+                     os.path.dirname(os.path.abspath(__file__)), "smaul_kernels*.so"))
+                 if ".tmp." not in os.path.basename(p)]
         cands.sort(key=lambda p: os.path.getmtime(p), reverse=True)
         if not cands:
             return None, {"available": False,
