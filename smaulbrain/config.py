@@ -13,6 +13,11 @@ Total = V*d + d + L*(4*d*d + 4*d + 3*d*hff)   [tied head]
 
 MoE experts: 2-matrix MLP with GELU: W_in (d*h), W_out (h*d),
   per-expert = 2*d*h. Router: d * n_experts.
+
+Optional multi-token prediction (MTP, DeepSeek-V3 style): depth K >= 1 adds
+K shared modules, each 6*d*d + 6*d params (RMSNorm gains on the previous
+hidden and the next-token embedding, a 2d->d projection, a pre-norm, a
+recurrent attention block, and an output norm feeding the shared tied head).
 """
 from dataclasses import dataclass, field
 
@@ -81,6 +86,12 @@ def expert_param_count(spec: PresetSpec) -> int:
     return 2 * spec.d_model * spec.expert_hidden
 
 
+def mtp_param_count(spec: PresetSpec, depth: int) -> int:
+    """Params added by `depth` MTP modules (shared, not per-expert)."""
+    d = spec.d_model
+    return max(0, int(depth)) * (6 * d * d + 6 * d)
+
+
 def shared_param_total(spec: PresetSpec) -> int:
     """Non-expert trainable params of an MoE model (embed+recurrent+norms+router)."""
     d, L, V = spec.d_model, spec.n_layers, spec.vocab_size
@@ -142,6 +153,26 @@ def parse_growth_loss_nats(raw):
     return v
 
 
+def parse_mtp_depth(raw) -> int:
+    try:
+        v = int(raw)
+    except (TypeError, ValueError):
+        raise ValueError(f"--mtp-depth must be a non-negative integer, got {raw!r}")
+    if v < 0:
+        raise ValueError(f"--mtp-depth must be >= 0, got {v}")
+    return v
+
+
+def parse_mtp_loss_weight(raw) -> float:
+    try:
+        v = float(raw)
+    except (TypeError, ValueError):
+        raise ValueError(f"--mtp-loss-weight must be a finite non-negative number, got {raw!r}")
+    if not (v >= 0) or v != v or v in (float("inf"), float("-inf")):
+        raise ValueError(f"--mtp-loss-weight must be a finite non-negative number, got {raw!r}")
+    return v
+
+
 def validate_quant_combo(forward_quant: str, backward_mode: str) -> None:
     if forward_quant not in FORWARD_QUANT_CHOICES:
         raise ValueError(f"--forward-quant must be one of {FORWARD_QUANT_CHOICES}")
@@ -153,8 +184,9 @@ def validate_quant_combo(forward_quant: str, backward_mode: str) -> None:
             f"backward={backward_mode}; supported: {sorted(SUPPORTED_QUANT_COMBOS)}")
 
 
-def arch_report(spec: PresetSpec, n_experts_current=None) -> dict:
+def arch_report(spec: PresetSpec, n_experts_current=None, mtp_depth=0) -> dict:
     d = spec.d_model
+    mtp = mtp_param_count(spec, mtp_depth)
     rep = {
         "preset": spec.name,
         "kind": spec.kind,
@@ -165,9 +197,11 @@ def arch_report(spec: PresetSpec, n_experts_current=None) -> dict:
         "recurrent_state_per_layer": d,
         "recurrent_state_total": spec.n_layers * d,
         "recurrent_state_bytes_fp32": spec.n_layers * d * 4,
+        "mtp_depth": int(mtp_depth),
+        "mtp_params": mtp,
     }
     if spec.kind == "dense":
-        rep["total_params"] = dense_param_total(spec)
+        rep["total_params"] = dense_param_total(spec) + mtp
     else:
         n = spec.n_experts_init if n_experts_current is None else n_experts_current
         rep["experts_init"] = spec.n_experts_init
@@ -177,5 +211,5 @@ def arch_report(spec: PresetSpec, n_experts_current=None) -> dict:
         rep["per_expert_params"] = expert_param_count(spec)
         rep["shared_params"] = shared_param_total(spec)
         rep["router_params"] = d * n
-        rep["total_params"] = shared_param_total(spec) + n * expert_param_count(spec)
+        rep["total_params"] = shared_param_total(spec) + n * expert_param_count(spec) + mtp
     return rep
