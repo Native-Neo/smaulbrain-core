@@ -90,14 +90,21 @@ print(engine.generate([65, 66, 67], max_new_tokens=16))
 
 ## Multi-token prediction (MTP)
 
-`--mtp-depth K` (default 2) adds K shared modules on top of the main model.
+`--mtp-depth K` (default 60) adds K shared modules on top of the main model.
 Depth k predicts `tok[i+k+1]` from the main hidden at position `i` and the
 embedding of `tok[i+k]`, using a 2d->d projection, a recurrent-attention block
-and the tied embedding/head (DeepSeek-V3 style, no stop-gradient):
+and the tied embedding/head (DeepSeek-V3 style, no stop-gradient). With
+`K=60`, one hidden state at position `i` is trained to predict the next 60
+tokens, one depth per step ahead:
 
 ```
 loss = CE(main) + Σ_k  mtp_loss_weight * CE(depth k)      # default weight 0.1
 ```
+
+Deep chains add one small module per depth (roughly `6d²+6d` params each) and
+one sequential module forward per training step, so they cost more than they
+change the main loss; lower `--mtp-loss-weight` if the aggregate auxiliary
+term (`K * weight`, 6.0 at depth 60 with the default) crowds the main loss.
 
 - MTP params are shared across experts, so growth/pruning/paging are
   unaffected; they are saved/loaded like every other parameter.
@@ -123,9 +130,15 @@ the matching prefix:
 - Draft-module states are advanced only over verified tokens (never polluted
   by rejected drafts); `export_states()`/`import_states()` carry the draft
   pipeline along when it exists, so greedy generation resumes exactly.
-- The state-safe drafting horizon is two tokens (`engine.draft_depth`), since
-  depth-k state at position `i` depends on `tok[i+k]`; deeper trained modules
-  are still used for their loss but not for drafting.
+- Any trained depth can draft: a deeper module whose state still lags the
+  frontier is advanced *tentatively* inside the draft pass over the drafts of
+  that same pass (e.g. depth 3 needs `tok[p+2] = draft 1` to reach position
+  `p`), one batched step per depth, and the tentative states are discarded at
+  the end of the round. `engine.draft_depth = min(speculative, mtp_depth)`.
+- Cost grows quadratically with the draft depth (each round re-extends every
+  depth from its verified position, about `K²/2` module rows for K drafts),
+  so `speculative` around 8-16 is the practical sweet spot on CPU; large K
+  (up to the model depth, 60 by default) trades speed for maximum lookahead.
 
 
 ## Quantization modes
