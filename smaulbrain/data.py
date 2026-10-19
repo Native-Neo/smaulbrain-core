@@ -1,4 +1,5 @@
 """Streaming byte-level dataset: never requires the corpus in RAM."""
+import hashlib
 import os
 import torch
 
@@ -14,6 +15,7 @@ class ByteStream:
         if data:
             self._data = bytes(data)
             self.size = len(self._data)
+            self.sha256 = hashlib.sha256(self._data).hexdigest()
         else:
             self._data = None
             assert path is not None
@@ -23,6 +25,11 @@ class ByteStream:
             # Reuse one buffered file handle instead of open/seek/read/close
             # on every training step.
             self._fh = open(path, "rb")
+            digest = hashlib.sha256()
+            while chunk := self._fh.read(1 << 20):
+                digest.update(chunk)
+            self.sha256 = digest.hexdigest()
+            self._fh.seek(0)
         self.cursor = 0
 
     def _read_at(self, off: int, n: int) -> bytes:
@@ -57,10 +64,13 @@ class ByteStream:
         return list(chunk)
 
     def state_dict(self) -> dict:
-        return {"cursor": self.cursor, "path": self.path, "size": self.size}
+        return {"cursor": self.cursor, "path": self.path, "size": self.size,
+                "sha256": self.sha256}
 
     def load_state_dict(self, sd: dict) -> None:
         if sd.get("size") != self.size or sd.get("path") != self.path:
+            raise ValueError("dataset mismatch on resume")
+        if sd.get("sha256") not in (None, self.sha256):
             raise ValueError("dataset mismatch on resume")
         raw_cursor = sd.get("cursor")
         if isinstance(raw_cursor, bool):
