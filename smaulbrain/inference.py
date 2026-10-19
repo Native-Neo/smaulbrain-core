@@ -11,11 +11,13 @@ single batched main-model forward, and accepts the matching prefix:
   (p-q)+, so the emitted distribution still equals the target distribution.
 
 MTP draft states are advanced only over verified tokens, keeping the draft
-distribution consistent with how the modules were trained. The state-safe
-drafting horizon is two tokens: depth-k state for position i needs tok[i+k],
-so depths beyond two would require speculatively advancing and rolling back
-draft states. Deeper MTP modules are still trained and saved; ``draft_depth``
-reports how many are actually used for drafting.
+distribution consistent with how the modules were trained. Module 1 uses the
+verified pipeline directly; deeper modules (depth >= 3) whose verified state
+still lags the frontier are advanced tentatively *inside* the draft pass over
+the drafts produced by that same pass, and the tentative states/outputs are
+discarded at the end of the iteration, so rejected drafts never pollute the
+verified pipeline. ``draft_depth`` (<= ``speculative`` and <= model
+``mtp_depth``) reports how many drafts are used per round.
 """
 import torch
 
@@ -34,7 +36,7 @@ class InferenceEngine:
         if self.speculative<0:raise ValueError("speculative must be >= 0")
         if self.speculative>self.mtp_depth:
             raise ValueError(f"speculative={self.speculative} exceeds model mtp_depth={self.mtp_depth}")
-        self.draft_depth=min(self.speculative,self.mtp_depth,2)
+        self.draft_depth=min(self.speculative,self.mtp_depth)
         self.generator=torch.Generator(device=getattr(model,"device","cpu"));self.generator.manual_seed(int(seed));self.states=model.init_states()
         self._reset_mtp()
 
@@ -208,17 +210,44 @@ class InferenceEngine:
         yield from self._generate_speculative(last,max_new_tokens,stop)
 
     def _mtp_draft(self,pos):
-        """Draft from position `pos` (the position of `last`). Uses the
-        verified-token state through pos-1 and never persists draft updates."""
+        """Draft up to `_mtp_K` tokens after the frontier at `pos`.
+
+        Each depth runs one batched step over its tentative span
+        [verified_pos_k, pos]: module 1 runs on verified state only, and deeper
+        modules whose verified state still lags `pos` are extended over the
+        drafts produced by shallower modules in this same pass (e.g. depth 3
+        needs tok[p+2] = draft 1 to reach position p), which is why spans are
+        processed in depth order. The last row of each step samples the draft
+        from that depth's logits. Tentative states and outputs live only for
+        this call: rejected drafts are never persisted, and the verified
+        pipeline is re-derived each round by `_mtp_catch_up`.
+        """
         drafts=[];qs=[]
-        h_prev=self._ring_get(self._h0,pos); tok_prev=self._tok_at(pos+1)
-        if h_prev is None or tok_prev is None: return drafts,qs
-        for k in range(1,self._mtp_K+1):
-            if self._mtp_pos[k-1]!=pos: break
-            logits,y,_s=self.model.mtp_step(k,h_prev,tok_prev,self._mtp_states[k-1])
-            probs=self._probs(logits); d=self._draw(probs)
+        K=self._mtp_K
+        if K<=0: return drafts,qs
+        pending={}                       # absolute position -> tentative token
+        out=[dict() for _ in range(K)]   # out[k-1][pos] = tentative h_k output
+        def tok_tent(p):
+            if p in pending: return pending[p]
+            return self._tok_at(p)
+        def hprev_tent(k,j):
+            if k==1: return self._ring_get(self._h0,j)
+            return out[k-2].get(j, self._ring_get(self._h[k-2],j))
+        for k in range(1,K+1):
+            rows=list(range(self._mtp_pos[k-1],pos+1))
+            H=[];T=[];ready=True
+            for j in rows:
+                hp=hprev_tent(k,j); tv=tok_tent(j+k)
+                if hp is None or tv is None: ready=False; break
+                H.append(hp);T.append(tv)
+            if not ready: break
+            logits,Y,_s=self.model._mtp_module(k,torch.stack(H),
+                                               torch.tensor(T,dtype=torch.long),
+                                               state=self._mtp_states[k-1])
+            for j,row in zip(rows,Y): out[k-1][j]=row
+            probs=self._probs(logits[-1]); d=self._draw(probs)
             drafts.append(d);qs.append(probs)
-            h_prev=y;tok_prev=d
+            pending[pos+k+1]=d
         return drafts,qs
 
     def _rollback(self,hist,idx):
@@ -260,8 +289,9 @@ class InferenceEngine:
                 if d in stop or remaining==0:
                     # Keep the invariant "state covers all but the last
                     # emitted token": roll back and drop unemitted records.
+                    # `pos` is absolute, the token list may be trimmed.
                     self._rollback(hist,m)
-                    del self._toks[pos+3+m:]
+                    del self._toks[max(0,pos+3+m-self._tok_base):]
                     return
             remaining-=1; yield repl
             if repl in stop or remaining==0: return
