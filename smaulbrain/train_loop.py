@@ -92,6 +92,10 @@ class Trainer:
                  "capacity_factor": self.model.capacity_factor,
                  "mtp_depth": self.model.mtp_depth,
                  "mtp_loss_weight": self.model.mtp_loss_weight,
+                 "synth_bytes": getattr(self.args, "synth_bytes", None),
+                 "data_stream": {"kind": "file" if self.stream.path is not None else "synthetic",
+                                 "path": self.stream.path, "size": self.stream.size,
+                                 "sha256": self.stream.sha256},
                  "eval_cursor": (self.eval_stream.cursor
                                  if self.eval_stream is not None else None)}
         factored = {k: bool(state["factored"]) for k, state in self.opt.state.items()}
