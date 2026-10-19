@@ -67,5 +67,10 @@ class SmaulOPT:
         flags=factored_flags or {}; self.state={}
         for k,s in sd.items():
             entry={sk:(torch.as_tensor(sv).clone() if not isinstance(sv,torch.Tensor) else sv.clone()) for sk,sv in s.items()}
-            entry["factored"]=bool(flags.get(k,"R" in entry))
+            factored="R" in entry
+            if k in flags and bool(flags[k])!=factored:
+                raise ValueError(
+                    f"load_state_dict: factored_flags[{k!r}]={bool(flags[k])} contradicts "
+                    f"the stored state layout ({'R/C' if factored else 'v'} moments)")
+            entry["factored"]=factored
             self.state[k]=entry
