@@ -577,6 +577,15 @@ def fp8_e4m3_quantize(W: np.ndarray, scale=None):
         finite_abs = np.abs(Wf[np.isfinite(Wf)])
         mx = float(np.max(finite_abs)) if finite_abs.size else 0.0
         scale = np.float32(mx / FP8_E4M3_MAX) if mx > 0 else np.float32(1.0)
+    else:
+        # Keep the same float32 precision as the torch path (ctypes.c_float),
+        # so both backends agree bit-for-bit for every input scale.
+        try:
+            scale = np.float32(scale)
+        except (OverflowError, ValueError):
+            scale = np.float32(np.inf if float(scale) > 0 else (-np.inf if float(scale) < 0 else 0.0))
+        if not np.isfinite(scale) and scale == 0:
+            scale = np.float32(1.0)
     if scale == 0:
         scale = np.float32(1.0)
     norm = Wf / float(scale)
