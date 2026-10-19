@@ -33,7 +33,8 @@ def ternary_threshold(W):
 
 def ternary_scale(W, q):
     W = _tensor(W); q = _tensor(q, device=W.device, dtype=torch.int8)
-    nz = W.abs()[q.reshape(-1) != 0] if bool((q != 0).any()) else W.abs().reshape(-1)
+    flat = W.reshape(-1)
+    nz = flat.abs()[q.reshape(-1) != 0] if bool((q != 0).any()) else flat.abs()
     scale = float(nz.double().mean().item()) if nz.numel() else 1.0
     return scale if scale > 0 else 1.0
 
