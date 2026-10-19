@@ -29,7 +29,7 @@ def detect() -> dict:
         info["has_avx2"] = "avx2" in flags
         info["has_avx512"] = any(x in flags for x in ("avx512f", "avx512bw", "avx512vl"))
         info["has_sse2"] = "sse2" in flags
-    except OSError:
+    except (OSError, IndexError, ValueError):
         pass
     return info
 
