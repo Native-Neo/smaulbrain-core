@@ -104,7 +104,10 @@ def whole_model_total(spec: PresetSpec, n_experts=None) -> int:
     if spec.kind == "dense":
         return dense_param_total(spec)
     n = spec.n_experts_init if n_experts is None else n_experts
-    return shared_param_total(spec) + n * expert_param_count(spec)
+    # the router is resized with the expert registry (growth/prune), so
+    # re-base its d*n_experts_init contribution to d*n
+    return shared_param_total(spec) + (n - spec.n_experts_init) * spec.d_model + \
+        n * expert_param_count(spec)
 
 
 def resolve_preset(cli_preset: str, moe: bool, dense: bool) -> str:
@@ -211,5 +214,6 @@ def arch_report(spec: PresetSpec, n_experts_current=None, mtp_depth=0) -> dict:
         rep["per_expert_params"] = expert_param_count(spec)
         rep["shared_params"] = shared_param_total(spec)
         rep["router_params"] = d * n
-        rep["total_params"] = shared_param_total(spec) + n * expert_param_count(spec) + mtp
+        rep["total_params"] = shared_param_total(spec) + (n - spec.n_experts_init) * d + \
+            n * expert_param_count(spec) + mtp
     return rep
