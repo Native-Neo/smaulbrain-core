@@ -62,7 +62,16 @@ class ByteStream:
     def load_state_dict(self, sd: dict) -> None:
         if sd.get("size") != self.size or sd.get("path") != self.path:
             raise ValueError("dataset mismatch on resume")
-        self.cursor = int(sd["cursor"])
+        raw_cursor = sd.get("cursor")
+        if isinstance(raw_cursor, bool):
+            raise ValueError("invalid dataset cursor")
+        try:
+            cursor = int(raw_cursor)
+        except (TypeError, ValueError, OverflowError):
+            raise ValueError("invalid dataset cursor") from None
+        if cursor != raw_cursor or not 0 <= cursor <= self.size:
+            raise ValueError("invalid dataset cursor")
+        self.cursor = cursor
 
 
 def synth_bytes(n: int, seed: int, period: int = 64) -> bytes:
