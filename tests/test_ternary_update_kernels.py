@@ -1,7 +1,8 @@
 import numpy as np
 import pytest
+import torch
 
-from smaulbrain import _quant_native as native
+from smaulbrain import _quant_native as native, quant
 
 
 @pytest.fixture(scope="module", autouse=True)
@@ -101,4 +102,12 @@ def test_native_apply_ternary_update_rejects_invalid_index():
             packed, 4,
             [np.array([4], dtype=np.int32)],
             [np.array([1], dtype=np.int8)],
+        )
+
+
+def test_quant_wrapper_rejects_mismatched_segment_counts():
+    packed = torch.zeros(3, dtype=torch.uint8)
+    with pytest.raises(ValueError, match="segment counts differ"):
+        quant.apply_ternary_update_segments(
+            packed, (1, 12), [torch.tensor([0])], []
         )
