@@ -305,7 +305,7 @@ def prepare_ternary_backend() -> bool:
         ]
         lib.smaulbrain_sample_ternary_updates.restype = ctypes.c_int
         lib.smaulbrain_apply_ternary_update_segments.argtypes = [
-            ptr_u8, ctypes.c_size_t,
+            ptr_u8, ctypes.c_size_t, ctypes.c_size_t,
             ctypes.POINTER(ptr_i32), ctypes.POINTER(ptr_i8), ptr_size,
             ctypes.c_size_t, ptr_size,
         ]
@@ -423,6 +423,8 @@ def apply_ternary_update_segments(
     packed_arr = np.asarray(packed)
     if packed_arr.dtype != np.uint8 or not packed_arr.flags.c_contiguous:
         raise ValueError("packed weights must be a contiguous uint8 buffer")
+    if int(n_weights) < 0 or int(n_weights) > packed_arr.nbytes * 4:
+        raise ValueError("packed buffer is too short for the declared weight count")
     if sum(int(a.size) for a in index_segments) != sum(
         int(a.size) for a in direction_segments
     ):
@@ -451,7 +453,8 @@ def apply_ternary_update_segments(
     changed = ctypes.c_size_t(0)
     status = _NATIVE_LIB.smaulbrain_apply_ternary_update_segments(
         packed_arr.ctypes.data_as(ctypes.POINTER(ctypes.c_uint8)),
-        int(n_weights), ptr_i32_arrays, ptr_i8_arrays, sizes,
+        int(packed_arr.nbytes), int(n_weights),
+        ptr_i32_arrays, ptr_i8_arrays, sizes,
         len(index_segments), ctypes.byref(changed),
     )
     if status != 0:
