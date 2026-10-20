@@ -473,7 +473,7 @@ extern "C" int smaulbrain_sample_ternary_updates(
 }
 
 extern "C" int smaulbrain_apply_ternary_update_segments(
-    std::uint8_t* packed, std::size_t n_weights,
+    std::uint8_t* packed, std::size_t packed_bytes, std::size_t n_weights,
     const std::int32_t* const* index_segments,
     const std::int8_t* const* direction_segments,
     const std::size_t* segment_sizes, std::size_t n_segments,
@@ -482,6 +482,8 @@ extern "C" int smaulbrain_apply_ternary_update_segments(
         (n_segments > 0 && (!index_segments || !direction_segments || !segment_sizes)))
         return 1;
     *changed_count = 0;
+    const std::size_t required_bytes = n_weights / 4 + (n_weights % 4 != 0 ? 1 : 0);
+    if (packed_bytes < required_bytes) return 4;
     std::size_t total = 0;
     for (std::size_t s = 0; s < n_segments; ++s) {
         if (segment_sizes[s] > std::numeric_limits<std::size_t>::max() - total)
