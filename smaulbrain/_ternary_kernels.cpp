@@ -520,6 +520,69 @@ extern "C" int smaulbrain_apply_ternary_updates(
     return 0;
 }
 
+extern "C" int smaulbrain_apply_ternary_update_segments(
+    std::uint8_t* packed, std::size_t n_weights,
+    const std::int32_t* const* index_segments,
+    const std::int8_t* const* direction_segments,
+    const std::size_t* segment_sizes, std::size_t n_segments,
+    std::size_t* changed_count) noexcept {
+    if (!packed || !changed_count ||
+        (n_segments > 0 && (!index_segments || !direction_segments || !segment_sizes)))
+        return 1;
+    *changed_count = 0;
+    std::size_t total = 0;
+    for (std::size_t s = 0; s < n_segments; ++s) {
+        if (segment_sizes[s] > std::numeric_limits<std::size_t>::max() - total)
+            return 1;
+        if (segment_sizes[s] > 0 && (!index_segments[s] || !direction_segments[s]))
+            return 1;
+        total += segment_sizes[s];
+    }
+
+    std::vector<std::pair<std::size_t, int>> sorted;
+    sorted.reserve(total);
+    for (std::size_t s = 0; s < n_segments; ++s) {
+        for (std::size_t i = 0; i < segment_sizes[s]; ++i) {
+            const std::int32_t index = index_segments[s][i];
+            const int direction = static_cast<int>(direction_segments[s][i]);
+            if (index < 0 || static_cast<std::size_t>(index) >= n_weights ||
+                direction < -1 || direction > 1)
+                return 2;
+            if (direction != 0)
+                sorted.emplace_back(static_cast<std::size_t>(index), direction);
+        }
+    }
+    std::sort(sorted.begin(), sorted.end(),
+              [](const auto& a, const auto& b) { return a.first < b.first; });
+
+    std::size_t i = 0;
+    while (i < sorted.size()) {
+        const std::size_t index = sorted[i].first;
+        int vote = 0;
+        do {
+            vote += sorted[i].second;
+            ++i;
+        } while (i < sorted.size() && sorted[i].first == index);
+        const int direction = (vote > 0) - (vote < 0);
+        if (direction == 0) continue;
+
+        const std::size_t byte_index = index >> 2;
+        const unsigned shift = static_cast<unsigned>((index & 3u) * 2u);
+        const unsigned old_byte = static_cast<unsigned>(packed[byte_index]);
+        const unsigned old_code = (old_byte >> shift) & 0x3u;
+        if (old_code > 2u) return 3;
+        const int candidate = static_cast<int>(old_code) + direction;
+        const unsigned new_code = static_cast<unsigned>(
+            std::max(0, std::min(2, candidate)));
+        if (new_code == old_code) continue;
+        const unsigned mask = 0x3u << shift;
+        packed[byte_index] = static_cast<std::uint8_t>(
+            (old_byte & ~mask) | (new_code << shift));
+        ++(*changed_count);
+    }
+    return 0;
+}
+
 extern "C" int smaulbrain_recurrent_scan(
     const float* kv, const float* alpha, float* state, float* states,
     std::size_t T, std::size_t d) {
