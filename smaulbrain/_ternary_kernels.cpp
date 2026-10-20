@@ -428,11 +428,15 @@ extern "C" int smaulbrain_sample_ternary_updates(
     *selected_count = 0;
     if (rate == 0.0f) return 0;
 
-    // Iterate in physical-gradient order when the gradient is a transposed GEMM
-    // result (stride0=1), keeping reads cache-friendly on small CPUs.
+    // Keep the smaller-stride axis in the inner loop for contiguous reads.
+    const bool col_outer = stride0 <= stride1;
+    const std::size_t n_outer = col_outer ? cols : rows;
+    const std::size_t n_inner = col_outer ? rows : cols;
     double abs_sum = 0.0;
-    for (std::size_t col = 0; col < cols; ++col) {
-        for (std::size_t row = 0; row < rows; ++row) {
+    for (std::size_t o = 0; o < n_outer; ++o) {
+        for (std::size_t in = 0; in < n_inner; ++in) {
+            const std::size_t row = col_outer ? in : o;
+            const std::size_t col = col_outer ? o : in;
             const float g = grad[static_cast<std::ptrdiff_t>(row) * stride0 +
                                  static_cast<std::ptrdiff_t>(col) * stride1];
             if (!std::isfinite(g)) return 3;
@@ -443,8 +447,10 @@ extern "C" int smaulbrain_sample_ternary_updates(
     if (!(mean_abs > 0.0) || !std::isfinite(mean_abs)) return 0;
 
     std::size_t count = 0;
-    for (std::size_t col = 0; col < cols; ++col) {
-        for (std::size_t row = 0; row < rows; ++row) {
+    for (std::size_t o = 0; o < n_outer; ++o) {
+        for (std::size_t in = 0; in < n_inner; ++in) {
+            const std::size_t row = col_outer ? in : o;
+            const std::size_t col = col_outer ? o : in;
             const float g = grad[static_cast<std::ptrdiff_t>(row) * stride0 +
                                  static_cast<std::ptrdiff_t>(col) * stride1];
             if (g == 0.0f) continue;
