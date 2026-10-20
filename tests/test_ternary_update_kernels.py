@@ -45,13 +45,12 @@ def test_native_apply_ternary_update_segments_combines_conflicting_votes():
         ],
         direction_segments=[
             np.array([1, 1, -1, 1], dtype=np.int8),
-            np.array([-1, -1, 1], dtype=np.int8),
+            np.array([-1, -1, -1], dtype=np.int8),
         ],
     )
 
-    # Index 0 moves 0->+1. Votes for index 1 cancel. Index 4 moves
-    # 0->-1->? its two negative votes combine to one move: 0->-1.
-    # Index 7 votes also cancel.
+    # Index 0 moves 0->+1. Votes for index 1 cancel. The two negative
+    # votes for index 4 combine into one move to -1; index 7 cancels.
     codes = native.unpack_codes(packed, shape).reshape(-1)
     assert changed == 2
     assert codes[0] == 1
