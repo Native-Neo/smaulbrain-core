@@ -293,6 +293,23 @@ def prepare_ternary_backend() -> bool:
             ptr_f32, ptr_f32, ptr_f32, ptr_f32, ptr_f64, ptr_f32,
             ctypes.c_size_t, ctypes.c_size_t]
         lib.smaulbrain_recurrent_backward_scan.restype = ctypes.c_int
+
+        ptr_i32 = ctypes.POINTER(ctypes.c_int32)
+        ptr_i8 = ctypes.POINTER(ctypes.c_int8)
+        ptr_size = ctypes.POINTER(ctypes.c_size_t)
+        lib.smaulbrain_sample_ternary_updates.argtypes = [
+            ptr_f32, ctypes.c_size_t, ctypes.c_size_t,
+            ctypes.c_ssize_t, ctypes.c_ssize_t,
+            ctypes.c_float, ctypes.c_uint64,
+            ptr_i32, ptr_i8, ctypes.c_size_t, ptr_size,
+        ]
+        lib.smaulbrain_sample_ternary_updates.restype = ctypes.c_int
+        lib.smaulbrain_apply_ternary_update_segments.argtypes = [
+            ptr_u8, ctypes.c_size_t,
+            ctypes.POINTER(ptr_i32), ctypes.POINTER(ptr_i8), ptr_size,
+            ctypes.c_size_t, ptr_size,
+        ]
+        lib.smaulbrain_apply_ternary_update_segments.restype = ctypes.c_int
         _NATIVE_LIB = lib
         _NATIVE_VARIANT = "avx1" if has_avx else "sse2"
         _NATIVE_ERROR = None
@@ -332,6 +349,114 @@ def recurrent_scan(kv: np.ndarray, alpha: np.ndarray, state: np.ndarray,
     if status != 0:
         raise RuntimeError(f"native recurrent scan failed with status {status}")
     return True
+
+
+def sample_ternary_gradient_updates(
+    gradient: np.ndarray, rate: float, seed: int
+) -> tuple[np.ndarray, np.ndarray] | None:
+    """Sample sparse direct-ternary updates without Python masks or gradient copies.
+
+    The gradient may be a non-contiguous two-dimensional view, such as the
+    transpose of a PyTorch GEMM result. Returns flat logical indices and update
+    directions, or None when the native backend is unavailable.
+    """
+    if not prepare_ternary_backend():
+        return None
+    arr = np.asarray(gradient)
+    if arr.ndim != 2 or arr.size == 0:
+        raise ValueError("gradient must be a non-empty rank-2 array")
+    if arr.dtype != np.float32:
+        arr = arr.astype(np.float32, copy=False)
+    if any(stride < 0 or stride % arr.itemsize for stride in arr.strides):
+        raise ValueError("gradient must have non-negative float-aligned strides")
+    rows, cols = (int(arr.shape[0]), int(arr.shape[1]))
+    total = int(arr.size)
+    if float(rate) < 0.0:
+        raise ValueError("rate must be non-negative")
+
+    ptr_f32 = ctypes.POINTER(ctypes.c_float)
+    ptr_i32 = ctypes.POINTER(ctypes.c_int32)
+    ptr_i8 = ctypes.POINTER(ctypes.c_int8)
+    pointer = arr.ctypes.data_as(ptr_f32)
+    stride0 = int(arr.strides[0] // arr.itemsize)
+    stride1 = int(arr.strides[1] // arr.itemsize)
+    capacity = min(total, max(64, int(total * float(rate) * 2.0) + 64))
+    indices = np.empty(capacity, dtype=np.int32)
+    directions = np.empty(capacity, dtype=np.int8)
+    selected = ctypes.c_size_t(0)
+
+    def run(cap: int, out_indices: np.ndarray, out_directions: np.ndarray) -> int:
+        selected.value = 0
+        return int(_NATIVE_LIB.smaulbrain_sample_ternary_updates(
+            pointer, rows, cols, stride0, stride1,
+            ctypes.c_float(float(rate)), ctypes.c_uint64(int(seed)),
+            out_indices.ctypes.data_as(ptr_i32),
+            out_directions.ctypes.data_as(ptr_i8),
+            cap, ctypes.byref(selected),
+        ))
+
+    status = run(capacity, indices, directions)
+    if status == 2:
+        capacity = int(selected.value)
+        indices = np.empty(capacity, dtype=np.int32)
+        directions = np.empty(capacity, dtype=np.int8)
+        status = run(capacity, indices, directions)
+    if status == 3:
+        raise ValueError("non-finite gradients cannot update ternary weights")
+    if status != 0:
+        raise RuntimeError(f"native ternary gradient sampler failed with status {status}")
+    count = int(selected.value)
+    return indices[:count], directions[:count]
+
+
+def apply_ternary_update_segments(
+    packed: np.ndarray,
+    n_weights: int,
+    index_segments: list[np.ndarray],
+    direction_segments: list[np.ndarray],
+) -> int | None:
+    """Apply queued sparse update segments in C++ without concatenating them."""
+    if not prepare_ternary_backend():
+        return None
+    if len(index_segments) != len(direction_segments):
+        raise ValueError("index and direction segment counts differ")
+    packed_arr = np.asarray(packed)
+    if packed_arr.dtype != np.uint8 or not packed_arr.flags.c_contiguous:
+        raise ValueError("packed weights must be a contiguous uint8 buffer")
+    if sum(int(a.size) for a in index_segments) != sum(
+        int(a.size) for a in direction_segments
+    ):
+        raise ValueError("index and direction counts differ")
+    if not index_segments:
+        return 0
+
+    ptr_i32 = ctypes.POINTER(ctypes.c_int32)
+    ptr_i8 = ctypes.POINTER(ctypes.c_int8)
+    ptr_i32_arrays = (ptr_i32 * len(index_segments))()
+    ptr_i8_arrays = (ptr_i8 * len(direction_segments))()
+    sizes = (ctypes.c_size_t * len(index_segments))()
+    for i, (idx, direction) in enumerate(zip(index_segments, direction_segments)):
+        idx_arr = np.asarray(idx)
+        dir_arr = np.asarray(direction)
+        if idx_arr.dtype != np.int32 or dir_arr.dtype != np.int8:
+            raise ValueError("update indices must be int32 and directions int8")
+        if not idx_arr.flags.c_contiguous or not dir_arr.flags.c_contiguous:
+            raise ValueError("update arrays must be contiguous")
+        if idx_arr.size != dir_arr.size:
+            raise ValueError("index/direction segment lengths differ")
+        ptr_i32_arrays[i] = idx_arr.ctypes.data_as(ptr_i32)
+        ptr_i8_arrays[i] = dir_arr.ctypes.data_as(ptr_i8)
+        sizes[i] = int(idx_arr.size)
+
+    changed = ctypes.c_size_t(0)
+    status = _NATIVE_LIB.smaulbrain_apply_ternary_update_segments(
+        packed_arr.ctypes.data_as(ctypes.POINTER(ctypes.c_uint8)),
+        int(n_weights), ptr_i32_arrays, ptr_i8_arrays, sizes,
+        len(index_segments), ctypes.byref(changed),
+    )
+    if status != 0:
+        raise RuntimeError(f"native ternary update application failed with status {status}")
+    return int(changed.value)
 
 
 def recurrent_backward_scan(dS: np.ndarray, states: np.ndarray,
