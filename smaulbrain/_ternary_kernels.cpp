@@ -472,54 +472,6 @@ extern "C" int smaulbrain_sample_ternary_updates(
     return count > capacity ? 2 : 0;
 }
 
-extern "C" int smaulbrain_apply_ternary_updates(
-    std::uint8_t* packed, std::size_t n_weights,
-    const std::int32_t* indices, const std::int8_t* directions,
-    std::size_t n_updates, std::size_t* changed_count) noexcept {
-    if (!packed || !changed_count || (n_updates > 0 && (!indices || !directions)))
-        return 1;
-    *changed_count = 0;
-    std::vector<std::pair<std::size_t, int>> sorted;
-    sorted.reserve(n_updates);
-    for (std::size_t i = 0; i < n_updates; ++i) {
-        if (indices[i] < 0 || static_cast<std::size_t>(indices[i]) >= n_weights)
-            return 2;
-        const int direction = static_cast<int>(directions[i]);
-        if (direction < -1 || direction > 1) return 2;
-        if (direction != 0)
-            sorted.emplace_back(static_cast<std::size_t>(indices[i]), direction);
-    }
-    std::sort(sorted.begin(), sorted.end(),
-              [](const auto& a, const auto& b) { return a.first < b.first; });
-
-    std::size_t i = 0;
-    while (i < sorted.size()) {
-        const std::size_t index = sorted[i].first;
-        int vote = 0;
-        do {
-            vote += sorted[i].second;
-            ++i;
-        } while (i < sorted.size() && sorted[i].first == index);
-        const int direction = (vote > 0) - (vote < 0);
-        if (direction == 0) continue;
-
-        const std::size_t byte_index = index >> 2;
-        const unsigned shift = static_cast<unsigned>((index & 3u) * 2u);
-        const unsigned old_byte = static_cast<unsigned>(packed[byte_index]);
-        const unsigned old_code = (old_byte >> shift) & 0x3u;
-        if (old_code > 2u) return 3;  // code 3 is reserved by the packer
-        const int candidate = static_cast<int>(old_code) + direction;
-        const unsigned new_code = static_cast<unsigned>(
-            std::max(0, std::min(2, candidate)));
-        if (new_code == old_code) continue;
-        const unsigned mask = 0x3u << shift;
-        packed[byte_index] = static_cast<std::uint8_t>(
-            (old_byte & ~mask) | (new_code << shift));
-        ++(*changed_count);
-    }
-    return 0;
-}
-
 extern "C" int smaulbrain_apply_ternary_update_segments(
     std::uint8_t* packed, std::size_t n_weights,
     const std::int32_t* const* index_segments,
