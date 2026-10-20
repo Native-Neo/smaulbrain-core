@@ -152,6 +152,13 @@ package compiles a small C++ kernel on first use (cached); without a compiler
 it transparently falls back to a NumPy decode-and-multiply path. FP8 is
 software-emulated on CPU.
 
+The NCM runtime can also use native sparse direct-ternary update helpers. They
+sample update coordinates from a strided gradient view without building Python
+magnitude/probability/mask tensors, then apply queued updates to packed trits in
+C++ without concatenating the per-backward update lists. These helpers are
+optional APIs; callers can detect their availability and retain a portable
+fallback.
+
 ## Native kernels
 
 `smaulbrain.kernels.build_here()` compiles the optional scalar C++ reference
