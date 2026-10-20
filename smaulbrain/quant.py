@@ -142,6 +142,10 @@ def apply_ternary_update_segments(packed, shape, index_segments, direction_segme
     packed_cpu = packed.detach()
     if packed_cpu.dtype != torch.uint8 or not packed_cpu.is_contiguous():
         return None
+    index_segments = list(index_segments)
+    direction_segments = list(direction_segments)
+    if len(index_segments) != len(direction_segments):
+        raise ValueError("index and direction segment counts differ")
     index_arrays = []
     direction_arrays = []
     for indices, directions in zip(index_segments, direction_segments):
