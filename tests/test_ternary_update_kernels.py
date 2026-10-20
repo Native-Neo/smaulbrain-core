@@ -60,6 +60,18 @@ def test_native_apply_ternary_update_segments_combines_conflicting_votes():
     assert not np.array_equal(packed, before)
 
 
+def test_native_apply_ternary_update_rejects_oversized_declared_shape():
+    packed = np.array([0x55], dtype=np.uint8)
+    before = packed.copy()
+    with pytest.raises(ValueError, match="packed buffer is too short"):
+        native.apply_ternary_update_segments(
+            packed, 5,
+            [np.array([4], dtype=np.int32)],
+            [np.array([1], dtype=np.int8)],
+        )
+    assert np.array_equal(packed, before)
+
+
 def test_native_apply_ternary_update_rejects_invalid_index():
     packed = np.array([0x55], dtype=np.uint8)
     with pytest.raises(RuntimeError, match="status 2"):
