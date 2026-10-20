@@ -60,6 +60,28 @@ def test_native_apply_ternary_update_segments_combines_conflicting_votes():
     assert not np.array_equal(packed, before)
 
 
+def test_cpp_boundary_rejects_packed_buffer_shorter_than_declared_shape():
+    packed = np.array([0x55], dtype=np.uint8)
+    before = packed.copy()
+    changed = native.ctypes.c_size_t(0)
+    pointer_u8 = native.ctypes.POINTER(native.ctypes.c_uint8)
+
+    status = native._NATIVE_LIB.smaulbrain_apply_ternary_update_segments(
+        packed.ctypes.data_as(pointer_u8),
+        packed.nbytes,
+        5,  # five weights need two packed bytes, but only one is supplied
+        None,
+        None,
+        None,
+        0,
+        native.ctypes.byref(changed),
+    )
+
+    assert status == 4
+    assert changed.value == 0
+    assert np.array_equal(packed, before)
+
+
 def test_native_apply_ternary_update_rejects_oversized_declared_shape():
     packed = np.array([0x55], dtype=np.uint8)
     before = packed.copy()
