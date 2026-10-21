@@ -9,6 +9,8 @@
 #include <cstdint>
 #include <cmath>
 #include <vector>
+#include <utility>
+#include <limits>
 #include <atomic>
 #include <condition_variable>
 #include <cstdlib>
@@ -395,6 +397,149 @@ extern "C" int smaulbrain_pack_ternary(
     if (!(scale > 0.0)) scale = 1.0;
     *scale_out = static_cast<float>(scale);
     *threshold_out = static_cast<float>(threshold);
+    return 0;
+}
+
+// ---------------------------------------------------------------------------
+// Sparse direct-ternary optimizer helpers.
+//
+// Sampling reads a possibly strided logical (rows, cols) gradient without
+// making a contiguous copy or allocating probability/mask tensors in Python.
+// Output indices use row-major logical indexing into the packed ternary matrix.
+static inline std::uint64_t sb_splitmix64(std::uint64_t x) noexcept {
+    x += UINT64_C(0x9e3779b97f4a7c15);
+    x = (x ^ (x >> 30)) * UINT64_C(0xbf58476d1ce4e5b9);
+    x = (x ^ (x >> 27)) * UINT64_C(0x94d049bb133111eb);
+    return x ^ (x >> 31);
+}
+
+extern "C" int smaulbrain_sample_ternary_updates(
+    const float* grad, std::size_t rows, std::size_t cols,
+    std::ptrdiff_t stride0, std::ptrdiff_t stride1,
+    float rate, std::uint64_t seed,
+    std::int32_t* indices_out, std::int8_t* directions_out,
+    std::size_t capacity, std::size_t* selected_count) noexcept {
+    if (!grad || !selected_count || rows == 0 || cols == 0 ||
+        stride0 < 0 || stride1 < 0 || !std::isfinite(rate) || rate < 0.0f)
+        return 1;
+    if (rows > static_cast<std::size_t>(std::numeric_limits<std::int32_t>::max()) / cols)
+        return 1;
+    const std::size_t total = rows * cols;
+    *selected_count = 0;
+    if (rate == 0.0f) return 0;
+
+    // Keep the smaller-stride axis in the inner loop for contiguous reads.
+    const bool col_outer = stride0 <= stride1;
+    const std::size_t n_outer = col_outer ? cols : rows;
+    const std::size_t n_inner = col_outer ? rows : cols;
+    double abs_sum = 0.0;
+    for (std::size_t o = 0; o < n_outer; ++o) {
+        for (std::size_t in = 0; in < n_inner; ++in) {
+            const std::size_t row = col_outer ? in : o;
+            const std::size_t col = col_outer ? o : in;
+            const float g = grad[static_cast<std::ptrdiff_t>(row) * stride0 +
+                                 static_cast<std::ptrdiff_t>(col) * stride1];
+            if (!std::isfinite(g)) return 3;
+            abs_sum += std::abs(static_cast<double>(g));
+        }
+    }
+    const double mean_abs = abs_sum / static_cast<double>(total);
+    if (!(mean_abs > 0.0) || !std::isfinite(mean_abs)) return 0;
+
+    std::size_t count = 0;
+    for (std::size_t o = 0; o < n_outer; ++o) {
+        for (std::size_t in = 0; in < n_inner; ++in) {
+            const std::size_t row = col_outer ? in : o;
+            const std::size_t col = col_outer ? o : in;
+            const float g = grad[static_cast<std::ptrdiff_t>(row) * stride0 +
+                                 static_cast<std::ptrdiff_t>(col) * stride1];
+            if (g == 0.0f) continue;
+            const double probability = std::min(
+                1.0, std::abs(static_cast<double>(g)) *
+                     static_cast<double>(rate) / mean_abs);
+            const std::size_t logical_index = row * cols + col;
+            // Stateless PRNG makes a retry with a larger output buffer identical.
+            const std::uint64_t bits = sb_splitmix64(
+                seed ^ (static_cast<std::uint64_t>(logical_index) *
+                        UINT64_C(0x9e3779b97f4a7c15)));
+            const double uniform = static_cast<double>(bits >> 11) *
+                                   (1.0 / 9007199254740992.0);
+            if (uniform < probability) {
+                if (count < capacity) {
+                    if (!indices_out || !directions_out) return 1;
+                    indices_out[count] = static_cast<std::int32_t>(logical_index);
+                    directions_out[count] = g > 0.0f ? -1 : 1;
+                }
+                ++count;
+            }
+        }
+    }
+    *selected_count = count;
+    return count > capacity ? 2 : 0;
+}
+
+extern "C" int smaulbrain_apply_ternary_update_segments(
+    std::uint8_t* packed, std::size_t packed_bytes, std::size_t n_weights,
+    const std::int32_t* const* index_segments,
+    const std::int8_t* const* direction_segments,
+    const std::size_t* segment_sizes, std::size_t n_segments,
+    std::size_t* changed_count) noexcept {
+    if (!packed || !changed_count ||
+        (n_segments > 0 && (!index_segments || !direction_segments || !segment_sizes)))
+        return 1;
+    *changed_count = 0;
+    const std::size_t required_bytes = n_weights / 4 + (n_weights % 4 != 0 ? 1 : 0);
+    if (packed_bytes < required_bytes) return 4;
+    std::size_t total = 0;
+    for (std::size_t s = 0; s < n_segments; ++s) {
+        if (segment_sizes[s] > std::numeric_limits<std::size_t>::max() - total)
+            return 1;
+        if (segment_sizes[s] > 0 && (!index_segments[s] || !direction_segments[s]))
+            return 1;
+        total += segment_sizes[s];
+    }
+
+    std::vector<std::pair<std::size_t, int>> sorted;
+    sorted.reserve(total);
+    for (std::size_t s = 0; s < n_segments; ++s) {
+        for (std::size_t i = 0; i < segment_sizes[s]; ++i) {
+            const std::int32_t index = index_segments[s][i];
+            const int direction = static_cast<int>(direction_segments[s][i]);
+            if (index < 0 || static_cast<std::size_t>(index) >= n_weights ||
+                direction < -1 || direction > 1)
+                return 2;
+            if (direction != 0)
+                sorted.emplace_back(static_cast<std::size_t>(index), direction);
+        }
+    }
+    std::sort(sorted.begin(), sorted.end(),
+              [](const auto& a, const auto& b) { return a.first < b.first; });
+
+    std::size_t i = 0;
+    while (i < sorted.size()) {
+        const std::size_t index = sorted[i].first;
+        int vote = 0;
+        do {
+            vote += sorted[i].second;
+            ++i;
+        } while (i < sorted.size() && sorted[i].first == index);
+        const int direction = (vote > 0) - (vote < 0);
+        if (direction == 0) continue;
+
+        const std::size_t byte_index = index >> 2;
+        const unsigned shift = static_cast<unsigned>((index & 3u) * 2u);
+        const unsigned old_byte = static_cast<unsigned>(packed[byte_index]);
+        const unsigned old_code = (old_byte >> shift) & 0x3u;
+        if (old_code > 2u) return 3;
+        const int candidate = static_cast<int>(old_code) + direction;
+        const unsigned new_code = static_cast<unsigned>(
+            std::max(0, std::min(2, candidate)));
+        if (new_code == old_code) continue;
+        const unsigned mask = 0x3u << shift;
+        packed[byte_index] = static_cast<std::uint8_t>(
+            (old_byte & ~mask) | (new_code << shift));
+        ++(*changed_count);
+    }
     return 0;
 }
 

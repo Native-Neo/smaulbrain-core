@@ -121,6 +121,44 @@ def packed_matmat_transpose(dY, packed, shape, scale):
     return (dy @ codes.to(dy.dtype).T) * float(scale)
 
 
+def sample_ternary_gradient_updates(gradient, rate: float, seed: int):
+    """Return sparse direct-ternary update arrays, or None without the C++ backend."""
+    grad = _tensor(gradient)
+    if grad.device.type != "cpu":
+        return None
+    sampled = _native.sample_ternary_gradient_updates(
+        grad.detach().numpy(), float(rate), int(seed)
+    )
+    if sampled is None:
+        return None
+    indices, directions = sampled
+    return torch.from_numpy(indices), torch.from_numpy(directions)
+
+
+def apply_ternary_update_segments(packed, shape, index_segments, direction_segments):
+    """Apply queued sparse ternary update segments in native code when available."""
+    if not isinstance(packed, torch.Tensor) or packed.device.type != "cpu":
+        return None
+    packed_cpu = packed.detach()
+    if packed_cpu.dtype != torch.uint8 or not packed_cpu.is_contiguous():
+        return None
+    index_segments = list(index_segments)
+    direction_segments = list(direction_segments)
+    if len(index_segments) != len(direction_segments):
+        raise ValueError("index and direction segment counts differ")
+    index_arrays = []
+    direction_arrays = []
+    for indices, directions in zip(index_segments, direction_segments):
+        idx = indices.detach().to(device="cpu", dtype=torch.int32).contiguous()
+        direction = directions.detach().to(device="cpu", dtype=torch.int8).contiguous()
+        index_arrays.append(idx.numpy())
+        direction_arrays.append(direction.numpy())
+    return _native.apply_ternary_update_segments(
+        packed_cpu.numpy(), int(shape[0]) * int(shape[1]),
+        index_arrays, direction_arrays,
+    )
+
+
 def packed_matvec(x, packed, shape, scale, allow_dense_reconstruction=False):
     return packed_matmat(x, packed, shape, scale, allow_dense_reconstruction)
 
