@@ -92,6 +92,10 @@ class Trainer:
                  "capacity_factor": self.model.capacity_factor,
                  "mtp_depth": self.model.mtp_depth,
                  "mtp_loss_weight": self.model.mtp_loss_weight,
+                 "synth_bytes": getattr(self.args, "synth_bytes", None),
+                 "data_stream": {"kind": "file" if self.stream.path is not None else "synthetic",
+                                 "path": self.stream.path, "size": self.stream.size,
+                                 "sha256": self.stream.sha256},
                  "eval_cursor": (self.eval_stream.cursor
                                  if self.eval_stream is not None else None)}
         factored = {k: bool(state["factored"]) for k, state in self.opt.state.items()}
@@ -149,8 +153,10 @@ class Trainer:
             self.rng.set_state(torch.tensor(rng_state["torch_state"], dtype=torch.uint8))
         # Legacy NumPy RNG state is intentionally not replayed; resumed model and optimizer
         # tensors are exact, while newly introduced random experts use their recorded seed.
+        data_stream = ck_cfg.get("data_stream") or {}
         self.stream.load_state_dict({"cursor": man["data_cursor"], "path": self.stream.path,
-                                     "size": self.stream.size})
+                                     "size": self.stream.size,
+                                     "sha256": data_stream.get("sha256")})
         if self.eval_stream is not None and ck_cfg.get("eval_cursor") is not None:
             # Growth evidence must replay from the exact eval position, or the
             # resumed ranking (and therefore the grown model) can differ.
