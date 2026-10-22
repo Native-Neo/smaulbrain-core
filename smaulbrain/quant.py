@@ -14,6 +14,7 @@ prepare_ternary_backend = _native.prepare_ternary_backend
 ternary_backend_name = _native.ternary_backend_name
 recurrent_scan = _native.recurrent_scan
 recurrent_backward_scan = _native.recurrent_backward_scan
+retile_ternary = _native.retile_ternary
 
 
 def _tensor(x, device=None, dtype=torch.float32):

@@ -125,6 +125,33 @@ def pack_ternary_tiled(W: np.ndarray):
     return packed, scale, shape, th
 
 
+def retile_ternary(packed, shape):
+    """Convert canonical row-major 2-bit codes to the tile-contiguous layout.
+
+    The tile-contiguous layout is what the fast native matmul kernels read;
+    the canonical row-major bytes stay the portable/reference format. This
+    helper never materializes a dense weight matrix. Returns a contiguous
+    uint8 buffer, or None when the native backend is unavailable.
+    """
+    if not prepare_ternary_backend() or _NATIVE_LIB is None:
+        return None
+    if hasattr(packed, "detach"):  # torch tensor
+        p = packed.detach().to("cpu").contiguous().numpy()
+    else:
+        p = _rowmajor_bytes(packed, shape)
+    d_in, d_out = int(shape[0]), int(shape[1])
+    if d_in < 1 or d_out < 1:
+        raise ValueError(f"invalid packed matrix shape {shape}")
+    p = np.ascontiguousarray(p, dtype=np.uint8)
+    buf = np.empty(((d_out + 15) // 16) * d_in * 4, dtype=np.uint8)
+    if _NATIVE_LIB.smaulbrain_retile_ternary(
+            p.ctypes.data_as(ctypes.POINTER(ctypes.c_uint8)),
+            buf.ctypes.data_as(ctypes.POINTER(ctypes.c_uint8)),
+            d_in, d_out) != 0:
+        return None
+    return buf
+
+
 def _untile_rowmajor(buf: np.ndarray, shape) -> np.ndarray:
     """Canonical row-major 2-bit bytes for the tile-contiguous native layout.
 

@@ -229,6 +229,39 @@ def test_pack_ternary_tiled_matches_canonical(dout):
     assert np.allclose(got, X.astype(np.float64) @ ref, atol=2e-5, rtol=2e-5)
 
 
+@pytest.mark.parametrize("din,dout", [(6, 1), (6, 16), (6, 31), (33, 65), (128, 1000)])
+def test_retile_ternary_matches_the_tiled_packer(din, dout):
+    """retile_ternary() converts canonical bytes without a dense weight."""
+    rng = np.random.default_rng(din * 1000 + dout)
+    W = (rng.standard_normal((din, dout)) * 0.4).astype(np.float32)
+    packed, scale, shape, _ = qn.pack_ternary(W)
+    buf = qn.retile_ternary(packed, shape)
+    if buf is None:
+        pytest.skip("native backend unavailable")
+    assert buf.dtype == np.uint8 and buf.nbytes == ((dout + 15) // 16) * din * 4
+    assert np.array_equal(_decode_tiled(buf, din, dout),
+                          _decode_tiled(qn.pack_ternary_tiled(W)[0].buf, din, dout))
+    # the fast kernels read the retiled buffer exactly like the packed one
+    X = rng.standard_normal((3, din)).astype(np.float32)
+    want = qn.packed_matmat(X, packed, shape, scale)
+    got = qn.packed_matmat(X, qn.TiledPacked(buf), shape, scale)
+    assert np.allclose(got, want, atol=2e-5, rtol=2e-5)
+
+
+def test_retile_ternary_accepts_torch_buffers():
+    """Callers keep the canonical codes in a torch buffer; retile must work."""
+    torch.manual_seed(3)
+    W = torch.randn(17, 29)
+    packed, scale, shape, _ = qn.pack_ternary(W.numpy())
+    buf = qn.retile_ternary(torch.from_numpy(packed.copy()), shape)
+    if buf is None:
+        pytest.skip("native backend unavailable")
+    X = torch.randn(4, 17)
+    want = qn.packed_matmat(X.numpy(), packed, shape, scale)
+    got = qn.packed_matmat(X.numpy(), qn.TiledPacked(buf), shape, scale)
+    assert np.allclose(got, want, atol=2e-5, rtol=2e-5)
+
+
 def test_pack_ternary_tiled_retile_fallback(monkeypatch):
     """Simulate a build without the fused SIMD packer: retile must agree."""
     W = (np.random.default_rng(5).standard_normal((7, 31)) * 0.6).astype(np.float32)
