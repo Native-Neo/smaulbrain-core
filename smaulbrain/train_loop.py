@@ -296,6 +296,7 @@ class Trainer:
     def _adopt_candidate(self, cand, new_ids):
         model, opt = self.model, self.opt
         model.p = cand
+        model._paged_leaves = {}
         opt.register(cand)  # zero-init state for the new experts
         if model.store is not None:
             for nid in new_ids:
@@ -327,7 +328,8 @@ class Trainer:
                 raise RuntimeError(f"non-finite gradient norm at step {self.sched.global_step}")
             if total > grad_clip and total > 0:
                 scale = grad_clip / total
-                grads = {k: g * scale for k, g in grads.items()}
+                for g in grads.values():
+                    g.mul_(scale)
             # Training never consumes per-parameter update norms; skip their
             # extra full-array reductions unless an explicit caller requests them.
             self.opt.step(self.model.p, grads, collect_norms=False)

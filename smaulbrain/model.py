@@ -64,7 +64,8 @@ class PackedCache:
         if e is not None and e["ref"]() is W and e["version"] == W._version:
             self.reuse_hits += 1; return e["packed"], e["scale"], e["shape"]
         packed, scale, shape, _ = _quant.pack_ternary_tiled(W)
-        if key not in self.d and len(self.d) >= self.max_entries: self.d.pop(next(iter(self.d)))
+        if key not in self.d and self.max_entries > 0 and len(self.d) >= self.max_entries:
+            self.d.pop(next(iter(self.d)))
         self.d[key]={"packed":packed,"scale":scale,"shape":shape,"ref":weakref.ref(W),"version":W._version}
         self.builds += 1; return packed, scale, shape
     def invalidate(self, keys=None):
@@ -80,7 +81,7 @@ class FP8Cache:
         if e is not None and e["ref"]() is W and e["version"] == W._version:
             self.reuse_hits += 1; return e["weight"], e["scale"]
         Wq,scale=_quant.fp8_e4m3_quantize(W.detach())
-        if key not in self.d and len(self.d)>=self.max_entries: self.d.pop(next(iter(self.d)))
+        if key not in self.d and self.max_entries > 0 and len(self.d)>=self.max_entries: self.d.pop(next(iter(self.d)))
         self.d[key]={"weight":Wq.detach(),"scale":scale,"ref":weakref.ref(W),"version":W._version}
         self.builds += 1; return Wq.detach(),scale
     def invalidate(self,keys=None):
@@ -338,6 +339,12 @@ class Model(nn.Module):
         grads={k:v.grad.detach() for k,v in p.items() if v.grad is not None}
         out=float(loss.detach().item()); aux=dict(self._last_aux)
         aux["loss_main"]=float(loss_main.detach().item()); aux["mtp_losses"]=mtp_losses
+        # Drop references to the forward activations/graph before returning so
+        # peak memory does not retain them alongside the caller's gradients.
+        del logits, det, loss, loss_main
+        # Release the paged expert leaves and their autograd graphs now that
+        # their gradients have been folded into the parameter gradients.
+        self._paged_leaves={}
         self.zero_grad(set_to_none=True)
         return out,grads,aux
 
