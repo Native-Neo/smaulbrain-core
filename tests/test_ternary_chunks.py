@@ -35,7 +35,7 @@ def test_chunk_sampler_preserves_global_importance_and_maps_indices(monkeypatch)
 
     # Local flat indices 0, 3, 5 map to (row, col) coordinates (0,0),
     # (1,1), (2,1) in the two-column chunk, then to global columns 2, 3, 3.
-    assert indices.tolist() == [2, 8, 14]
+    assert indices.tolist() == [2, 8, 13]
     assert directions.tolist() == [-1, 1, -1]
     assert len(calls) == 1
     assert calls[0][1] == pytest.approx(0.1)  # .2 * chunk_mean(3.5) / global_mean(7)
