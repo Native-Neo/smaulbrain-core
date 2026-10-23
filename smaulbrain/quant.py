@@ -98,7 +98,7 @@ def packed_matmat(X, packed, shape, scale, allow_dense_reconstruction=False):
     p = _kernel_pack(packed)
     if x.device.type == "cpu":
         y = _native.packed_matmat(_np(x), p, shape, scale, False)
-        return torch.from_numpy(y.copy()).to(dtype=x.dtype)
+        return torch.from_numpy(y).to(dtype=x.dtype)
     # Accelerator fallback: decode only to signed ternary codes for the matmul;
     # no latent FP32/FP8 master weight is reconstructed or cached.
     codes = unpack_codes(packed, shape).to(device=x.device, dtype=torch.int8)
@@ -117,7 +117,7 @@ def packed_matmat_transpose(dY, packed, shape, scale):
     p = _kernel_pack(packed)
     if dy.device.type == "cpu":
         out = _native.packed_matmat_transpose(_np(dy), p, shape, scale)
-        return torch.from_numpy(out.copy()).to(dtype=dy.dtype)
+        return torch.from_numpy(out).to(dtype=dy.dtype)
     codes = unpack_codes(packed, shape).to(device=dy.device, dtype=torch.int8)
     return (dy @ codes.to(dy.dtype).T) * float(scale)
 
@@ -176,28 +176,37 @@ def _fp8_table(device):
     return table
 
 
+_FP8_CHUNK = 1 << 18
+
+
 def fp8_e4m3_quantize(W, scale=None):
     W = _tensor(W)
     table = _fp8_table(W.device)
-    wf = W.double()
+    flat = W.reshape(-1)
     if scale is None:
-        finite = wf[torch.isfinite(wf)].abs()
-        mx = float(finite.max().item()) if finite.numel() else 0.0
+        mx = 0.0
+        for c in flat.split(_FP8_CHUNK):
+            finite = c[torch.isfinite(c)]
+            if finite.numel():
+                mx = max(mx, float(finite.abs().max().item()))
         scale = mx / FP8_E4M3_MAX if mx > 0 else 1.0
     try:
         scale = ctypes.c_float(float(scale)).value or 1.0
     except OverflowError:
         scale = float("inf")
-    norm = wf / scale
-    finite = torch.isfinite(norm)
-    mag = torch.where(finite, norm.abs().clamp(max=FP8_E4M3_MAX), torch.zeros_like(norm))
-    hi = torch.searchsorted(table, mag).clamp(max=table.numel() - 1)
-    lo = (hi - 1).clamp(min=0)
-    lower, upper = table[lo], table[hi]
-    nearest = torch.where((upper - mag) < (mag - lower), upper, lower)
-    sign = torch.where(norm < 0, -1.0, 1.0)
-    out = torch.where(finite, sign * nearest, norm) * scale
-    return out.to(torch.float32), scale
+    # Chunked so the float64 working set is bounded instead of ~10 full-size float64 temporaries.
+    out = torch.empty_like(flat, dtype=torch.float32)
+    for c, o in zip(flat.split(_FP8_CHUNK), out.split(_FP8_CHUNK)):
+        norm = c.double() / scale
+        finite = torch.isfinite(norm)
+        mag = torch.where(finite, norm.abs().clamp(max=FP8_E4M3_MAX), torch.zeros_like(norm))
+        hi = torch.searchsorted(table, mag).clamp(max=table.numel() - 1)
+        lo = (hi - 1).clamp(min=0)
+        lower, upper = table[lo], table[hi]
+        nearest = torch.where((upper - mag) < (mag - lower), upper, lower)
+        sign = torch.where(norm < 0, -1.0, 1.0)
+        o.copy_(torch.where(finite, sign * nearest, norm) * scale)
+    return out.reshape(W.shape), scale
 
 
 def fp8_error_bound(scale: float) -> float:

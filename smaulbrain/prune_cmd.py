@@ -76,6 +76,8 @@ def prune_checkpoint(ckpt_dir: str, rm_worst: int, eval_batches, min_samples: in
          "prev_count": len(eids), "new_count": len(keep)})
     renamed.pop("router", None)  # shape-bound; re-initialized on load
     _ckpt.save_checkpoint(ckpt_dir, man2, new_params, renamed)
+    # Release the first copy (params + optimizer moments) before re-reading the written checkpoint.
+    del blob, params, m, R, opt_state, new_params, new_opt, renamed
     blob2 = _ckpt.load_checkpoint(ckpt_dir)
     m2 = _model.Model(spec, blob2["params"], mtp_depth=mtp_depth)
     logits, _ = m2.forward([65, 66, 67, 68], train=False)

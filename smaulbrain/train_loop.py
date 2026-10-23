@@ -136,12 +136,13 @@ class Trainer:
                              "requested_depth": self.model.mtp_depth})
             self.model.mtp_depth = ck_mtp
         self.model.mtp_loss_weight = float(ck_cfg.get("mtp_loss_weight", self.model.mtp_loss_weight))
+        self.model.store = None  # still references the freshly initialised experts; rebuilt below
         self.model.p = blob["params"]
         self.model._assert_counts()
         self.model.packed.invalidate()
         self.model.fp8.invalidate()
         flags = man.get("optimizer", {}).get("factored", {})
-        self.opt.load_state_dict(blob["opt_state"], flags)
+        self.opt.load_state_dict(blob.pop("opt_state"), flags, copy=False)
         for state in self.opt.state.values():
             for key,value in list(state.items()):
                 if isinstance(value, torch.Tensor): state[key] = value.to(self.model.device)
@@ -250,7 +251,8 @@ class Trainer:
         logits, _ = probe.forward(toks, train=False)
         if not torch.isfinite(logits).all().item():
             raise RuntimeError("candidate validation failed: non-finite logits")
-        _loss, _grads, _ = probe.loss_and_backward(toks)
+        probe.loss_and_backward(toks)
+        del probe  # its grads/activations must not stay alive through the checkpoint write
         if fail_at == "during_optinit":
             raise _Injected(fail_at)
         # commit: scheduler transition + atomic publish, then adopt
@@ -322,7 +324,8 @@ class Trainer:
             if not math.isfinite(loss):
                 raise RuntimeError(f"non-finite loss at step {self.sched.global_step}")
             # gradient clipping (global norm)
-            total_sq = sum(g.detach().square().sum(dtype=torch.float64).item() for g in grads.values())
+            total_sq = sum(c.square().sum(dtype=torch.float64).item()
+                           for g in grads.values() for c in g.detach().reshape(-1).split(1 << 20))
             total = math.sqrt(total_sq)
             if not math.isfinite(total):
                 raise RuntimeError(f"non-finite gradient norm at step {self.sched.global_step}")

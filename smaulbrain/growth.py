@@ -204,7 +204,8 @@ def clone_with_mutation(params: dict, sources: list, new_ids: list, noise_scale:
 def grow_candidate(params: dict, router_W, sources: list, new_ids: list, noise_scale: float, seed: int,
                    n_exact_unperturbed: int, fail_at=None):
     if fail_at == "during_clone": raise RuntimeError("injected failure during_clone")
-    cand = {k:_as_torch(v).detach().clone() for k,v in params.items()}
+    # Unchanged tensors are shared, not copied: nothing below mutates them in place, and cloning would double model RAM here.
+    cand = {k:_as_torch(v).detach() for k,v in params.items()}
     router_W = _as_torch(router_W)
     if fail_at == "during_mutate": raise RuntimeError("injected failure during_mutate")
     detail = clone_with_mutation(cand,sources,new_ids,noise_scale,seed,n_exact_unperturbed)

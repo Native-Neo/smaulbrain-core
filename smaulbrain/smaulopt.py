@@ -50,11 +50,14 @@ class SmaulOPT:
                 if st["factored"]:
                     st["R"].mul_(b2).add_(g2.mean(dim=1),alpha=omb2)
                     st["C"].mul_(b2).add_(g2.mean(dim=0),alpha=omb2)
+                    del g2
                     denom_r=st["R"].mean().clamp_min(1e-30)
-                    vhat=(st["R"][:,None]*st["C"][None,:]/denom_r).clamp_min(0)
+                    vhat=(st["R"][:,None]*st["C"][None,:]).div_(denom_r).clamp_min_(0)
                 else:
-                    st["v"].mul_(b2).add_(g2,alpha=omb2); vhat=st["v"].clamp_min(0)
-                upd=st["m"]/(vhat.sqrt()+eps)
+                    st["v"].mul_(b2).add_(g2,alpha=omb2); del g2
+                    vhat=st["v"].clamp_min(0)
+                # In-place on the single full-size temporary instead of five chained ones; same float ops.
+                upd=torch.div(st["m"],vhat.sqrt_().add_(eps),out=vhat)
                 if collect_norms:norms[name]=float(upd.square().mean().sqrt().item())
                 w.add_(upd,alpha=-self.lr)
         self.n_updates+=1
@@ -63,10 +66,11 @@ class SmaulOPT:
     def state_dict(self):
         return {k:{sk:(sv.clone() if isinstance(sv,torch.Tensor) else sv) for sk,sv in s.items() if sk!="factored"} for k,s in self.state.items()}
 
-    def load_state_dict(self,sd,factored_flags=None):
+    def load_state_dict(self,sd,factored_flags=None,copy=True):
+        # copy=False adopts the caller's tensors (no second copy of every moment); only for a payload that is discarded after loading.
         flags=factored_flags or {}; self.state={}
         for k,s in sd.items():
-            entry={sk:(torch.as_tensor(sv).clone() if not isinstance(sv,torch.Tensor) else sv.clone()) for sk,sv in s.items()}
+            entry={sk:(torch.as_tensor(sv).clone() if not isinstance(sv,torch.Tensor) else (sv.clone() if copy else sv)) for sk,sv in s.items()}
             factored="R" in entry
             if k in flags and bool(flags[k])!=factored:
                 raise ValueError(
