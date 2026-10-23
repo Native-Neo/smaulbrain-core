@@ -34,7 +34,7 @@ def test_chunk_sampler_preserves_global_importance_and_maps_indices(monkeypatch)
     )
 
     # Local flat indices 0, 3, 5 map to (row, col) coordinates (0,0),
-    # (1,1), (2,1) in the two-column chunk, then to global columns 2, 3, 3.
+    # (1,1), (2,1) in the two-column chunk, then to global flat indices 2, 8, 13.
     assert indices.tolist() == [2, 8, 13]
     assert directions.tolist() == [-1, 1, -1]
     assert len(calls) == 1
