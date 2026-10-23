@@ -136,6 +136,93 @@ def sample_ternary_gradient_updates(gradient, rate: float, seed: int):
     return torch.from_numpy(indices), torch.from_numpy(directions)
 
 
+
+def sample_ternary_gradient_update_chunk(
+    gradient,
+    rate: float,
+    seed: int,
+    global_mean_abs: float,
+    full_cols: int,
+    column_offset: int,
+):
+    """Sample one gradient chunk using the full matrix's importance mean.
+
+    Returned indices are global row-major indices for a matrix whose logical
+    shape is (gradient.shape[0], full_cols). Chunking therefore changes peak
+    memory, not the per-coordinate Bernoulli probability:
+    min(1, abs(g) * rate / global_mean_abs).
+    """
+    grad = _tensor(gradient)
+    if grad.ndim != 2 or grad.numel() == 0:
+        raise ValueError("gradient chunk must be a non-empty rank-2 tensor")
+    rate = float(rate)
+    global_mean_abs = float(global_mean_abs)
+    full_cols = int(full_cols)
+    column_offset = int(column_offset)
+    rows, cols = (int(grad.shape[0]), int(grad.shape[1]))
+    if rate < 0.0:
+        raise ValueError("rate must be non-negative")
+    if full_cols < 1 or column_offset < 0 or column_offset + cols > full_cols:
+        raise ValueError("gradient chunk is outside the declared full matrix")
+    if rows * full_cols > 2**31 - 1:
+        raise ValueError("global ternary update indices exceed int32 capacity")
+    if not bool(torch.isfinite(grad).all()):
+        raise ValueError("non-finite gradients cannot update ternary weights")
+    if not global_mean_abs > 0.0 or global_mean_abs == float("inf"):
+        empty_indices = torch.empty(0, dtype=torch.int32)
+        empty_directions = torch.empty(0, dtype=torch.int8)
+        return empty_indices, empty_directions
+
+    # Match the native sampler's double-precision absolute-sum accumulation.
+    chunk_mean_abs = float(
+        grad.detach().abs().sum(dtype=torch.float64).item()
+    ) / float(grad.numel())
+    if not chunk_mean_abs > 0.0 or rate == 0.0:
+        return (
+            torch.empty(0, dtype=torch.int32),
+            torch.empty(0, dtype=torch.int8),
+        )
+
+    # The existing native sampler normalizes by this chunk's mean. Adjusting
+    # its rate makes its probability equal to the global-mean probability.
+    adjusted_rate = rate * chunk_mean_abs / global_mean_abs
+    sampled = None
+    if grad.device.type == "cpu":
+        sampled = _native.sample_ternary_gradient_updates(
+            grad.detach().numpy(), adjusted_rate, int(seed)
+        )
+
+    if sampled is not None:
+        local_indices = torch.from_numpy(sampled[0].copy()).to(torch.long)
+        directions = torch.from_numpy(sampled[1].copy()).to(torch.int8)
+    else:
+        importance = grad.detach().abs()
+        probabilities = (
+            importance * (rate / global_mean_abs)
+        ).clamp_(max=1.0)
+        selected = torch.rand(
+            importance.shape, device=importance.device
+        ) < probabilities
+        selected &= importance > 0
+        local_indices = selected.reshape(-1).nonzero(as_tuple=False).flatten()
+        directions = (
+            -grad.detach().reshape(-1).index_select(0, local_indices)
+            .sign().to(torch.int8)
+        )
+
+    if local_indices.numel() == 0:
+        return (
+            torch.empty(0, dtype=torch.int32),
+            torch.empty(0, dtype=torch.int8),
+        )
+    global_indices = (
+        torch.div(local_indices, cols, rounding_mode="floor") * full_cols
+        + column_offset + local_indices.remainder(cols)
+    )
+    return global_indices.to(device="cpu", dtype=torch.int32), directions.to(
+        device="cpu", dtype=torch.int8
+    )
+
 def apply_ternary_update_segments(packed, shape, index_segments, direction_segments):
     """Apply queued sparse ternary update segments in native code when available."""
     if not isinstance(packed, torch.Tensor) or packed.device.type != "cpu":
