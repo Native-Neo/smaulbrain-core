@@ -391,6 +391,7 @@ class Model:
 
     def _mtp_module(self, k, H, tok_in, state=None):
         p = self.p
+        H = as_tensor(H)
         px = f"mtp.{k}."
         hn = self._rmsnorm(H, p[px + "hn"])
         en = self._rmsnorm(p["embed"][np.asarray(tok_in, dtype=np.int64)], p[px + "en"])
