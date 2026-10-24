@@ -1040,6 +1040,12 @@ class Module:
             self._modules.pop(name, None)
         object.__setattr__(self, name, value)
 
+    def __delattr__(self, name):
+        self._parameters.pop(name, None)
+        self._buffers.pop(name, None)
+        self._modules.pop(name, None)
+        object.__delattr__(self, name)
+
     def register_parameter(self, name, param):
         setattr(self, name, param)
 
