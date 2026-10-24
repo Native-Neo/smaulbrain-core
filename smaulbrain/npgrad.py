@@ -293,6 +293,19 @@ class Tensor:
     def zero_grad(self):
         self.grad = None
 
+    def requires_grad_(self, value=True):
+        self.requires_grad = bool(value)
+        return self
+
+    def __float__(self):
+        return float(self.data)
+
+    def __int__(self):
+        return int(self.data)
+
+    def __index__(self):
+        return int(self.data)
+
     # -- operators ---------------------------------------------------------
     def __add__(self, other):
         return add(self, other)
