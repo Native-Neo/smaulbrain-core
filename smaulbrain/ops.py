@@ -88,9 +88,10 @@ class RecurrentAttention:
 
     def forward(self, X, s0=None):
         X = _tensor(X).float()
-        Wr, Wk, Wv, Wo = (getattr(self, k).float() for k in ("Wr", "Wk", "Wv", "Wo"))
-        w = self.w.float()
-        u = self.u.float()
+        Wr, Wk, Wv, Wo = (_tensor(getattr(self, k)).float()
+                          for k in ("Wr", "Wk", "Wv", "Wo"))
+        w = _tensor(self.w).float()
+        u = _tensor(self.u).float()
         alpha = ng.exp(-ng.softplus(w))
         state0 = None if s0 is None else _tensor(s0).float()
         r = X @ Wr
