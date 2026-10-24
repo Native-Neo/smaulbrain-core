@@ -1,81 +1,107 @@
-"""PyTorch top-k router and mixture-of-experts diagnostics."""
+"""NumPy top-k router and mixture-of-experts diagnostics."""
+from __future__ import annotations
+
 import math
-import torch
+
+import numpy as np
+
+from .npgrad import Tensor, default_rng
+
+
+def _arr(x, dtype=np.float32):
+    if isinstance(x, Tensor):
+        return np.asarray(x.data, dtype=dtype)
+    return np.asarray(x, dtype=dtype)
 
 
 class Router:
     def __init__(self, d: int, n_experts: int, rng=None, device="cpu"):
-        if isinstance(rng, torch.Generator):
+        if isinstance(rng, np.random.Generator):
             generator = rng
         else:
-            seed = 0 if rng is None else int(rng.integers(0, 2**63 - 1)) if hasattr(rng, "integers") else int(rng)
-            generator = torch.Generator(device="cpu").manual_seed(seed)
-        self.W = (torch.randn(d, n_experts, generator=generator) / math.sqrt(d)).to(device)
+            seed = 0 if rng is None else (int(rng.integers(0, 2**63 - 1)) if hasattr(rng, "integers") else int(rng))
+            generator = np.random.default_rng(seed)
+        self.W = (generator.standard_normal((d, n_experts)) / math.sqrt(d)).astype(np.float32)
 
     @property
     def n_experts(self):
         return self.W.shape[1]
 
     def route(self, X, top_k: int, capacity_factor: float = 1.25, disabled=()):
-        X = torch.as_tensor(X, dtype=torch.float32, device=self.W.device)
-        if not torch.isfinite(X).all(): raise ValueError("non-finite router inputs")
-        if top_k < 1: raise ValueError(f"top_k must be >= 1, got {top_k}")
+        X = _arr(X)
+        if not np.isfinite(X).all():
+            raise ValueError("non-finite router inputs")
+        if top_k < 1:
+            raise ValueError(f"top_k must be >= 1, got {top_k}")
         disabled = sorted(set(int(i) for i in disabled))
         enabled = self.n_experts - len(disabled)
-        if top_k > enabled: raise ValueError(f"top_k={top_k} exceeds enabled experts={enabled}")
+        if top_k > enabled:
+            raise ValueError(f"top_k={top_k} exceeds enabled experts={enabled}")
         scores = X @ self.W
-        if not torch.isfinite(scores).all(): raise ValueError("non-finite router scores")
+        if not np.isfinite(scores).all():
+            raise ValueError("non-finite router scores")
         if disabled:
-            if any(i < 0 or i >= self.n_experts for i in disabled): raise ValueError("disabled expert index out of range")
-            scores = scores.clone(); scores[:, disabled] = -torch.inf
-        idx = torch.argsort(scores, dim=1, descending=True, stable=True)[:, :top_k]
-        top_scores = scores.gather(1, idx)
-        raw_weights = torch.softmax(top_scores, dim=1)
+            if any(i < 0 or i >= self.n_experts for i in disabled):
+                raise ValueError("disabled expert index out of range")
+            scores = scores.copy()
+            scores[:, disabled] = -np.inf
+        idx = np.argsort(-scores, axis=1, kind="stable")[:, :top_k]
+        top_scores = np.take_along_axis(scores, idx, axis=1)
+        shifted = top_scores - np.max(top_scores, axis=1, keepdims=True)
+        exp = np.exp(shifted)
+        raw_weights = exp / np.sum(exp, axis=1, keepdims=True)
         T = X.shape[0]
         flat = idx.reshape(-1)
-        # capacity_factor=None disables capacity limiting. Speculative
-        # verification uses it: sequential single-token decoding never hits
-        # the per-expert cap (cap >= 1, one token contributes at most one hit
-        # per expert), so a batched no-drop pass reproduces it exactly.
-        cap = flat.numel() if capacity_factor is None else max(1, math.ceil(capacity_factor * T * top_k / self.n_experts))
-        order = torch.argsort(flat, stable=True)
+        # capacity_factor=None disables capacity limiting (speculative verification).
+        cap = flat.size if capacity_factor is None else max(
+            1, math.ceil(capacity_factor * T * top_k / self.n_experts))
+        order = np.argsort(flat, kind="stable")
         sorted_flat = flat[order]
-        counts = torch.bincount(sorted_flat, minlength=self.n_experts)
-        starts = torch.cumsum(counts, 0) - counts
-        rank = torch.arange(flat.numel(), device=flat.device) - starts[sorted_flat]
-        keep = torch.ones_like(flat, dtype=torch.bool)
+        counts = np.bincount(sorted_flat, minlength=self.n_experts)
+        starts = np.cumsum(counts) - counts
+        rank = np.arange(flat.size) - starts[sorted_flat]
+        keep = np.ones(flat.shape, dtype=bool)
         keep[order[rank >= cap]] = False
-        keep = keep.view_as(idx)
-        kept = raw_weights * keep.to(raw_weights.dtype)
-        denom = kept.sum(dim=1, keepdim=True)
-        weights = torch.where(denom > 0, kept / denom.clamp_min(1e-12), torch.zeros_like(kept))
-        load = counts.clamp(max=cap)
-        info = {"overflow_dropped": int(flat.numel() - load.sum().item()), "cap_per_expert": cap,
-                "load": load.detach().cpu().tolist()}
-        return idx, weights, info, (X, scores, idx, weights, keep)
+        keep = keep.reshape(idx.shape)
+        kept = raw_weights * keep.astype(raw_weights.dtype)
+        denom = kept.sum(axis=1, keepdims=True)
+        weights = np.where(denom > 0, kept / np.maximum(denom, 1e-12), np.zeros_like(kept))
+        load = np.minimum(counts, cap)
+        info = {"overflow_dropped": int(flat.size - load.sum()), "cap_per_expert": cap,
+                "load": load.tolist()}
+        return idx, weights.astype(np.float32), info, (X, scores, idx, weights, keep)
 
     def backward(self, dWeights, cache):
         X, scores, idx, weights, keep = cache
-        dWeights = torch.as_tensor(dWeights, dtype=weights.dtype, device=weights.device)
-        row_dot = (weights * dWeights).sum(dim=1, keepdim=True)
-        dtop = torch.where(keep, weights * (dWeights - row_dot), torch.zeros_like(weights))
-        dScores = torch.zeros_like(scores).scatter(1, idx, dtop)
+        dWeights = _arr(dWeights, dtype=weights.dtype)
+        row_dot = np.sum(weights * dWeights, axis=1, keepdims=True)
+        dtop = np.where(keep, weights * (dWeights - row_dot), np.zeros_like(weights))
+        dScores = np.zeros_like(scores)
+        np.put_along_axis(dScores, idx, dtop, axis=1)
         return dScores @ self.W.T, X.T @ dScores
 
 
 def softmax_rows(x):
-    return torch.softmax(x, dim=1)
+    x = _arr(x)
+    shifted = x - np.max(x, axis=1, keepdims=True)
+    e = np.exp(shifted)
+    return e / np.sum(e, axis=1, keepdims=True)
 
 
 def balance_aux_loss(weights, top_idx, n_experts):
-    if weights.shape[0] == 0: return 0.0
-    counts = torch.bincount(top_idx.reshape(-1), minlength=n_experts).float()
-    sums = torch.zeros(n_experts, device=weights.device).index_add_(0, top_idx.reshape(-1), weights.reshape(-1))
-    return float(n_experts * ((counts / weights.shape[0]) * (sums / weights.shape[0])).sum().item())
+    weights = _arr(weights)
+    top_idx = np.asarray(top_idx, dtype=np.int64)
+    if weights.shape[0] == 0:
+        return 0.0
+    counts = np.bincount(top_idx.reshape(-1), minlength=n_experts).astype(np.float32)
+    sums = np.zeros(n_experts, dtype=np.float32)
+    np.add.at(sums, top_idx.reshape(-1), weights.reshape(-1))
+    return float(n_experts * ((counts / weights.shape[0]) * (sums / weights.shape[0])).sum())
 
 
 def expert_output_stats(top_idx, weights, n_experts):
-    counts = torch.bincount(top_idx.reshape(-1), minlength=n_experts)
-    return {"tokens_total": int(top_idx.shape[0]), "per_expert_counts": counts.cpu().tolist(),
-            "mean_load": float(counts.float().mean().item()), "min_load": int(counts.min().item()),
-            "max_load": int(counts.max().item()), "unused_experts": torch.nonzero(counts == 0).flatten().cpu().tolist()}
+    top_idx = np.asarray(top_idx, dtype=np.int64)
+    counts = np.bincount(top_idx.reshape(-1), minlength=n_experts)
+    return {"tokens_total": int(top_idx.shape[0]), "per_expert_counts": counts.tolist(),
+            "mean_load": float(counts.astype(np.float32).mean()), "min_load": int(counts.min()),
+            "max_load": int(counts.max()), "unused_experts": np.nonzero(counts == 0)[0].tolist()}
