@@ -13,7 +13,8 @@ import time
 import math
 import tempfile
 import weakref
-import torch
+
+import numpy as np
 
 from . import checkpoint as _ckpt
 from . import config as _cfg
@@ -21,6 +22,7 @@ from . import growth as _growth
 from . import model as _model
 from . import paging as _paging
 from . import smaulopt as _opt
+from .npgrad import Tensor
 
 
 def _expert_dict(params: dict, eid: int) -> dict:
@@ -33,7 +35,7 @@ class Trainer:
         self.args = args
         self.stream = stream
         self.eval_stream = eval_stream
-        self.rng = torch.Generator(device="cpu").manual_seed(int(args.seed))
+        self.rng = np.random.default_rng(int(args.seed))
         n_exp = spec.n_experts_init if spec.kind == "moe" else 0
         params = _model.build_params(spec, self.rng, n_exp, device=getattr(args, "device", "cpu"),
                                      mtp_depth=getattr(args, "mtp_depth", 0))
@@ -74,12 +76,12 @@ class Trainer:
             return _paging.ExpertStore(mode, n_exp, ram_weights=ram)
         dd = disk_dir or self._live_experts_dir()
         os.makedirs(dd, exist_ok=True)
+        store = _paging.ExpertStore(mode, n_exp, disk_dir=dd,
+                                    ram_cache_max_experts=self.args.paging_cache_experts,
+                                    staging_max_bytes=self.args.paging_staging_bytes)
         for e in range(n_exp):
-            w = _expert_dict(params, e)
-            torch.save({k:v.detach().cpu() for k,v in w.items()}, os.path.join(dd, f"expert_{e}.pt"))
-        return _paging.ExpertStore(mode, n_exp, disk_dir=dd,
-                                   ram_cache_max_experts=self.args.paging_cache_experts,
-                                   staging_max_bytes=self.args.paging_staging_bytes)
+            store.register_expert(e, _expert_dict(params, e))
+        return store
 
     # -- checkpoint payload --
     def _build_manifest(self, params):
@@ -101,7 +103,7 @@ class Trainer:
         factored = {k: bool(state["factored"]) for k, state in self.opt.state.items()}
         return _ckpt.build_manifest(
             self.spec.name, arch, extra, self.sched.to_record(),
-            self.stream.cursor, {"torch_state": self.rng.get_state().tolist()},
+            self.stream.cursor, {"numpy_state": self.rng.bit_generator.state},
             n_exp, list(range(n_exp)),
             {"class": "SmaulOPT", "lr": self.opt.lr, "beta1": self.opt.beta1,
              "beta2": self.opt.beta2, "eps": self.opt.eps,
@@ -143,17 +145,15 @@ class Trainer:
         self.model.fp8.invalidate()
         flags = man.get("optimizer", {}).get("factored", {})
         self.opt.load_state_dict(blob.pop("opt_state"), flags, copy=False)
-        for state in self.opt.state.values():
-            for key,value in list(state.items()):
-                if isinstance(value, torch.Tensor): state[key] = value.to(self.model.device)
         self.opt.register(self.model.p)
         self.sched = _growth.GrowthScheduler.from_record(
             man["scheduler"], min_eval_samples=self.args.growth_min_eval_samples)
         rng_state = man.get("rng_state", {})
-        if "torch_state" in rng_state:
-            self.rng.set_state(torch.tensor(rng_state["torch_state"], dtype=torch.uint8))
-        # Legacy NumPy RNG state is intentionally not replayed; resumed model and optimizer
-        # tensors are exact, while newly introduced random experts use their recorded seed.
+        if "numpy_state" in rng_state:
+            self.rng.bit_generator.state = rng_state["numpy_state"]
+        # Legacy PyTorch RNG streams are intentionally not replayed; resumed model and
+        # optimizer tensors are exact, while newly introduced random experts use their
+        # recorded seed.
         data_stream = ck_cfg.get("data_stream") or {}
         self.stream.load_state_dict({"cursor": man["data_cursor"], "path": self.stream.path,
                                      "size": self.stream.size,
@@ -249,7 +249,8 @@ class Trainer:
                              mtp_loss_weight=self.model.mtp_loss_weight)
         toks = self._eval_batches(n_batches=1)[0]
         logits, _ = probe.forward(toks, train=False)
-        if not torch.isfinite(logits).all().item():
+        logits = logits.data if isinstance(logits, Tensor) else np.asarray(logits)
+        if not np.isfinite(logits).all():
             raise RuntimeError("candidate validation failed: non-finite logits")
         probe.loss_and_backward(toks)
         del probe  # its grads/activations must not stay alive through the checkpoint write
@@ -289,11 +290,11 @@ class Trainer:
         if old is None:
             return
         old_cols = int(old["m"].shape[1])
-        new_m = torch.zeros_like(new_router)
+        new_m = np.zeros_like(new_router, dtype=np.float32)
         new_m[:, :old_cols] = old["m"]
-        new_C = torch.zeros(new_router.shape[1], dtype=new_router.dtype, device=new_router.device)
+        new_C = np.zeros(new_router.shape[1], dtype=np.float32)
         new_C[:old_cols] = old["C"]
-        opt.state["router"] = {"m": new_m, "R": old["R"].clone(), "C": new_C, "factored": True}
+        opt.state["router"] = {"m": new_m, "R": old["R"].copy(), "C": new_C, "factored": True}
 
     def _adopt_candidate(self, cand, new_ids):
         model, opt = self.model, self.opt
@@ -323,16 +324,21 @@ class Trainer:
             loss, grads, info = self.model.loss_and_backward(toks)
             if not math.isfinite(loss):
                 raise RuntimeError(f"non-finite loss at step {self.sched.global_step}")
-            # gradient clipping (global norm)
-            total_sq = sum(c.square().sum(dtype=torch.float64).item()
-                           for g in grads.values() for c in g.detach().reshape(-1).split(1 << 20))
+            # gradient clipping (global norm); chunk so the float64 scratch
+            # stays bounded on large parameter sets.
+            total_sq = 0.0
+            for g in grads.values():
+                flat = np.asarray(g).reshape(-1)
+                for i in range(0, flat.size, 1 << 20):
+                    c = np.asarray(flat[i:i + (1 << 20)], dtype=np.float64)
+                    total_sq += float(c @ c)
             total = math.sqrt(total_sq)
             if not math.isfinite(total):
                 raise RuntimeError(f"non-finite gradient norm at step {self.sched.global_step}")
             if total > grad_clip and total > 0:
                 scale = grad_clip / total
                 for g in grads.values():
-                    g.mul_(scale)
+                    g *= scale
             # Training never consumes per-parameter update norms; skip their
             # extra full-array reductions unless an explicit caller requests them.
             self.opt.step(self.model.p, grads, collect_norms=False)
