@@ -892,7 +892,7 @@ def scan(values, alpha, s0=None):
     v = values.data[None, :, :] if one_dim else values.data
     a = alpha.data.astype(DTYPE)
     chunk = _scan_chunk_size(a)
-    initial = None if s0 is None else (_t(s0).data[None, :, :] if one_dim else _t(s0).data)
+    initial = None if s0 is None else (_t(s0).data[None, :] if one_dim else _t(s0).data)
     if initial is None:
         initial = np.zeros(v.shape[:-2] + (v.shape[-1],), dtype=DTYPE)
     out = _scan_forward(v, a, chunk, initial)
