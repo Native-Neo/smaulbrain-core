@@ -853,10 +853,10 @@ def _scan_chunk_size(alpha):
     return max(1, min(128, int(60.0 / exponent)))
 
 
-def _scan_forward(values, alpha, chunk):
+def _scan_forward(values, alpha, chunk, s0):
     lead = values.shape[:-2]
     T, D = values.shape[-2], values.shape[-1]
-    state = np.zeros(lead + (D,), dtype=DTYPE)
+    state = np.array(s0, dtype=DTYPE, copy=True)
     outs = np.empty_like(values, dtype=DTYPE)
     for start in range(0, T, chunk):
         end = min(start + chunk, T)
@@ -870,6 +870,37 @@ def _scan_forward(values, alpha, chunk):
         outs[..., start:end, :] = scanned
         state = scanned[..., -1, :].copy()
     return outs
+
+
+def scan(values, alpha, s0=None):
+    """s_t = alpha * s_{t-1} + values_t, returned for every t.
+
+    ``values`` has shape (..., T, D); ``alpha`` has shape (D,). ``s0`` is an
+    optional (..., D) initial state. No Python loop over positions: each chunk
+    uses a cumulative sum of exponentially weighted values.
+    """
+    values, alpha = _t(values), _t(alpha)
+    one_dim = values.ndim == 2
+    v = values.data[None, :, :] if one_dim else values.data
+    a = alpha.data.astype(DTYPE)
+    chunk = _scan_chunk_size(a)
+    initial = None if s0 is None else (_t(s0).data[None, :, :] if one_dim else _t(s0).data)
+    if initial is None:
+        initial = np.zeros(v.shape[:-2] + (v.shape[-1],), dtype=DTYPE)
+    out = _scan_forward(v, a, chunk, initial)
+
+    def bw(g):
+        g = g[None, :, :] if one_dim else g
+        dvalues, dalpha, ds0 = _scan_backward(g, out, a, initial, chunk)
+        if one_dim:
+            dvalues = dvalues[0]
+            ds0 = ds0[0]
+        if s0 is None:
+            return dvalues, dalpha.astype(alpha.data.dtype)
+        return dvalues, dalpha.astype(alpha.data.dtype), ds0.astype(_t(s0).data.dtype)
+
+    inputs = (values, alpha) if s0 is None else (values, alpha, s0)
+    return make_op(out[0] if one_dim else out, inputs, bw)
 
 
 def _scan_backward(grad, states, alpha, s0, chunk):
@@ -894,32 +925,8 @@ def _scan_backward(grad, states, alpha, s0, chunk):
         prev = states[..., start - 1:end - 1, :] if start > 0 else np.concatenate(
             [np.broadcast_to(s0[..., None, :], lead + (1, D)), states[..., :end - 1, :]], axis=-2)
         dalpha += np.sum(chunk_out.astype(np.float64) * prev.astype(np.float64), axis=tuple(range(len(lead) + 1)))
-    return dvalues, dalpha
-
-
-def scan(values, alpha):
-    """s_t = alpha * s_{t-1} + values_t, returned for every t.
-
-    ``values`` has shape (..., T, D); ``alpha`` has shape (D,). No Python loop
-    over positions: each chunk uses a cumulative sum of exponentially weighted
-    values.
-    """
-    values, alpha = _t(values), _t(alpha)
-    one_dim = values.ndim == 2
-    v = values.data[None, :, :] if one_dim else values.data
-    a = alpha.data.astype(DTYPE)
-    chunk = _scan_chunk_size(a)
-    out = _scan_forward(v, a, chunk)
-    s0 = np.zeros(v.shape[:-2] + (v.shape[-1],), dtype=DTYPE)
-
-    def bw(g):
-        g = g[None, :, :] if one_dim else g
-        dvalues, dalpha = _scan_backward(g, out, a, s0, chunk)
-        if one_dim:
-            dvalues = dvalues[0]
-        return dvalues, dalpha.astype(alpha.data.dtype)
-
-    return make_op(out[0] if one_dim else out, (values, alpha), bw)
+    ds0 = carry * alpha
+    return dvalues, dalpha, ds0
 
 
 # ---------------------------------------------------------------------------
