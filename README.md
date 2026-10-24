@@ -1,7 +1,7 @@
 # smaulbrain-core
 
 Byte-level recurrent language model with mixture-of-experts, ternary/FP8
-quantization, and a factored optimizer, on PyTorch.
+quantization, and a factored optimizer, in pure NumPy (CPU-only, float32).
 
 ## Features
 
@@ -13,9 +13,10 @@ quantization, and a factored optimizer, on PyTorch.
   control, and evidence-based expert growth (leave-one-out held-out loss).
 - **Quantization**: fp32, packed 2-bit ternary (with an optional native C++
   backend and a portable NumPy fallback), and software-emulated FP8 E4M3.
-- **Crash-safe checkpoints**: atomic publish, sha256-verified payloads,
-  `.bak` fallback recovery, and a two-phase growth protocol (pending, then
-  committed) that resumes exactly.
+- **Crash-safe checkpoints**: atomic publish, sha256-verified safetensors
+  payloads (`params.safetensors`, `optim.safetensors`), `.bak` fallback
+  recovery, and a two-phase growth protocol (pending, then committed) that
+  resumes exactly.
 - File-backed training streams are SHA-256 fingerprinted at startup and saved
   with checkpoint source metadata; resume checks content before continuing.
   Older checkpoints remain loadable and validate only their recorded path and
@@ -56,11 +57,11 @@ pip install .
 Forward/backward on a synthetic batch:
 
 ```python
-import torch
+import numpy as np
 from smaulbrain import config as cfg, model as M
 
 spec = cfg.PRESETS["moe-tiny"]
-params = M.build_params(spec, torch.Generator().manual_seed(0), spec.n_experts_init)
+params = M.build_params(spec, np.random.default_rng(0), spec.n_experts_init)
 model = M.Model(spec, params)
 loss, grads, info = model.loss_and_backward([65, 66, 67, 68])
 ```
@@ -166,7 +167,7 @@ fallback.
 ## Native kernels
 
 `smaulbrain.kernels.build_here()` compiles the optional scalar C++ reference
-kernels. Set `SMAULBRAIN_NATIVE_OPT=0` to force the pure-PyTorch optimizer
+kernels. Set `SMAULBRAIN_NATIVE_OPT=0` to force the pure-NumPy optimizer
 update path.
 
 ## License
