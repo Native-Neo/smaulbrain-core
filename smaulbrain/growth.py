@@ -18,9 +18,11 @@ the ranking key.
 """
 import time
 import math
-import torch
+
+import numpy as np
 
 from . import config as _cfg
+from .npgrad import Tensor, cross_entropy
 
 GROWTH_FULL_ADD = 8
 GROWTH_TINY_ADD = 2
@@ -28,8 +30,13 @@ GROWTH_TINY_ADD = 2
 def _add_count_for(spec):
     return GROWTH_FULL_ADD if spec.name == "moe-full" else GROWTH_TINY_ADD
 
-def _as_torch(value):
-    return value if isinstance(value, torch.Tensor) else torch.as_tensor(value, dtype=torch.float32)
+def _as_np(value):
+    if isinstance(value, Tensor):
+        value = value.data
+    return np.asarray(value, dtype=np.float32)
+
+def _numel(value):
+    return int(np.asarray(value.data if isinstance(value, Tensor) else value).size)
 
 
 class GrowthScheduler:
@@ -153,8 +160,8 @@ class GrowthScheduler:
 
 def eval_loss_on_tokens(model, tokens) -> float:
     logits, _ = model.forward(tokens, train=False)
-    tgt = torch.as_tensor(tokens[1:], dtype=torch.long, device=logits.device)
-    return float(torch.nn.functional.cross_entropy(logits[:-1], tgt).item())
+    tgt = np.asarray(tokens[1:], dtype=np.int64)
+    return float(cross_entropy(logits[:-1], tgt).item())
 
 
 def rank_experts(model, eval_batches, min_samples: int, max_batches=None):
@@ -174,8 +181,8 @@ def rank_experts(model, eval_batches, min_samples: int, max_batches=None):
 
 def eval_loss_on_tokens_disabled(model, tokens, disabled):
     logits, _ = model.forward(tokens, train=False, disabled=(disabled,))
-    tgt = torch.as_tensor(tokens[1:], dtype=torch.long, device=logits.device)
-    return float(torch.nn.functional.cross_entropy(logits[:-1], tgt).item())
+    tgt = np.asarray(tokens[1:], dtype=np.int64)
+    return float(cross_entropy(logits[:-1], tgt).item())
 
 
 def prepare_sources(scores: dict, n_needed: int):
@@ -185,19 +192,19 @@ def prepare_sources(scores: dict, n_needed: int):
 
 
 def clone_with_mutation(params: dict, sources: list, new_ids: list, noise_scale: float, seed: int, n_exact_unperturbed: int):
-    rng = torch.Generator(device="cpu").manual_seed(int(seed)); detail = []
+    rng = np.random.default_rng(int(seed)); detail = []
     for rank, (src, new) in enumerate(zip(sources, new_ids)):
         for suffix in ("Win", "Wout"):
-            skey, nkey = f"expert.{src}.{suffix}", f"expert.{new}.{suffix}"; W = _as_torch(params[skey])
+            skey, nkey = f"expert.{src}.{suffix}", f"expert.{new}.{suffix}"; W = _as_np(params[skey])
             if rank < n_exact_unperturbed:
-                params[nkey] = W.detach().clone()
-                detail.append({"expert":new,"source":src,"tensor":suffix,"mutated":False})
+                params[nkey] = W.copy()
+                detail.append({"expert": new, "source": src, "tensor": suffix, "mutated": False})
             else:
-                rms = float(W.detach().double().square().mean().sqrt().item())
+                rms = float(np.sqrt(np.mean(W.astype(np.float64) ** 2)))
                 sigma = noise_scale * (rms if rms > 0 else 1.0)
-                noise = torch.randn(tuple(W.shape), generator=rng, dtype=W.dtype).to(W.device)
-                params[nkey] = W.detach() + noise * sigma
-                detail.append({"expert":new,"source":src,"tensor":suffix,"mutated":True,"sigma":sigma})
+                noise = rng.standard_normal(W.shape, dtype=np.float32)
+                params[nkey] = W + noise * np.float32(sigma)
+                detail.append({"expert": new, "source": src, "tensor": suffix, "mutated": True, "sigma": sigma})
     return detail
 
 
@@ -205,26 +212,27 @@ def grow_candidate(params: dict, router_W, sources: list, new_ids: list, noise_s
                    n_exact_unperturbed: int, fail_at=None):
     if fail_at == "during_clone": raise RuntimeError("injected failure during_clone")
     # Unchanged tensors are shared, not copied: nothing below mutates them in place, and cloning would double model RAM here.
-    cand = {k:_as_torch(v).detach() for k,v in params.items()}
-    router_W = _as_torch(router_W)
+    cand = {k: _as_np(v).copy() if k in ("router",) else _as_np(v) for k, v in params.items()}
+    router_W = _as_np(router_W)
     if fail_at == "during_mutate": raise RuntimeError("injected failure during_mutate")
-    detail = clone_with_mutation(cand,sources,new_ids,noise_scale,seed,n_exact_unperturbed)
-    rng = torch.Generator(device="cpu").manual_seed(int(seed)+999); old_e=router_W.shape[1]; new_e=old_e+len(new_ids)
-    router=torch.empty((router_W.shape[0],new_e),dtype=router_W.dtype,device=router_W.device)
-    router[:,:old_e]=router_W.detach()
-    for i,src in enumerate(sources):
-        col=router_W[:,src].detach(); rms=float(col.double().square().mean().sqrt().item())
-        noise=torch.randn(tuple(col.shape), generator=rng, dtype=col.dtype).to(col.device)
-        router[:,old_e+i]=col+noise*(0.01*(rms or 1.0))
-    cand["router"]=router
-    return cand,detail
+    detail = clone_with_mutation(cand, sources, new_ids, noise_scale, seed, n_exact_unperturbed)
+    rng = np.random.default_rng(int(seed) + 999); old_e = router_W.shape[1]; new_e = old_e + len(new_ids)
+    router = np.empty((router_W.shape[0], new_e), dtype=np.float32)
+    router[:, :old_e] = router_W
+    for i, src in enumerate(sources):
+        col = router_W[:, src]
+        rms = float(np.sqrt(np.mean(col.astype(np.float64) ** 2)))
+        noise = rng.standard_normal(col.shape, dtype=np.float32)
+        router[:, old_e + i] = col + noise * np.float32(0.01 * (rms or 1.0))
+    cand["router"] = router
+    return cand, detail
 
 
 def validate_candidate(spec,cand_params,opt_names) -> None:
     eids=sorted(int(k.split(".")[1]) for k in cand_params if k.endswith(".Win"))
     if eids != list(range(len(eids))): raise ValueError("candidate expert registry not dense")
     for eid in eids:
-        n=cand_params[f"expert.{eid}.Win"].numel()+cand_params[f"expert.{eid}.Wout"].numel()
+        n=_numel(cand_params[f"expert.{eid}.Win"])+_numel(cand_params[f"expert.{eid}.Wout"])
         if n != _cfg.EXPECTED_EXPERT_PARAMS[spec.name]: raise ValueError(f"candidate expert {eid} has {n} params")
-    if cand_params["router"].shape[1] != len(eids): raise ValueError("candidate router width disagrees with registry")
-    if not all(torch.isfinite(v).all().item() for v in cand_params.values()): raise ValueError("candidate contains non-finite values")
+    if _as_np(cand_params["router"]).shape[1] != len(eids): raise ValueError("candidate router width disagrees with registry")
+    if not all(np.isfinite(_as_np(v)).all() for v in cand_params.values()): raise ValueError("candidate contains non-finite values")
