@@ -129,6 +129,42 @@ def sample_ternary_gradient_updates(gradient, rate: float, seed: int):
     return np.asarray(indices), np.asarray(directions)
 
 
+def sample_ternary_gradient_update_chunk(gradient, rate: float, seed: int,
+                                         global_mean_abs: float, full_cols: int,
+                                         column_offset: int):
+    """Sample one column-chunk of ternary code updates.
+
+    Returns flat logical indices into the ``(rows, full_cols)`` code matrix and
+    directions in {-1, 0, 1}. Sampling uses the full-matrix mean absolute
+    gradient so splitting a weight matrix into chunks does not change the
+    per-coordinate update probability.
+    """
+    grad = _np(gradient, np.float32)
+    if grad.ndim != 2:
+        raise ValueError("gradient chunk must be rank 2")
+    rows, cols = grad.shape
+    total_cols = int(full_cols)
+    offset = int(column_offset)
+    if offset < 0 or offset + cols > total_cols:
+        raise ValueError("gradient chunk exceeds the declared column count")
+    mean_abs = float(global_mean_abs)
+    if not mean_abs > 0.0 or float(rate) <= 0.0:
+        empty = np.empty(0, dtype=np.int32)
+        return empty, np.empty(0, dtype=np.int8)
+    importance = np.abs(grad)
+    probabilities = np.minimum(importance * (float(rate) / mean_abs), 1.0)
+    rng = np.random.default_rng(int(seed))
+    selected = (rng.random(grad.shape, dtype=np.float32) < probabilities) & (importance > 0)
+    local = np.flatnonzero(selected.reshape(-1))
+    if local.size == 0:
+        return np.empty(0, dtype=np.int32), np.empty(0, dtype=np.int8)
+    local_rows = local // cols
+    local_cols = local % cols
+    indices = (local_rows * total_cols + offset + local_cols).astype(np.int32)
+    directions = (-np.sign(grad.reshape(-1)[local])).astype(np.int8)
+    return indices, directions
+
+
 def apply_ternary_update_segments(packed, shape, index_segments, direction_segments):
     """Apply queued sparse ternary update segments in native code when available."""
     if isinstance(packed, Tensor):
