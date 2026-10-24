@@ -41,6 +41,9 @@ dependencies = [
 [project.optional-dependencies]
 test = ["pytest>=8"]
 
+[tool.pytest.ini_options]
+norecursedirs = ["tests/_reference"]
+
 [project.urls]
 Homepage = "https://github.com/Native-Neo/SmaulBRAIN"
 Repository = "https://github.com/Native-Neo/SmaulBRAIN"
