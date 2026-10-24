@@ -1,9 +1,10 @@
 """Evidence-based expert pruning with atomic checkpoint replacement."""
-import torch
+import numpy as np
 
 from . import checkpoint as _ckpt
 from . import growth as _growth
 from . import model as _model
+from .npgrad import Tensor
 
 
 def rank_for_prune(params: dict, scores: dict, n_remove: int, top_k: int, n_experts: int):
@@ -56,7 +57,8 @@ def prune_checkpoint(ckpt_dir: str, rm_worst: int, eval_batches, min_samples: in
         for suffix in ("Win", "Wout"):
             new_params[f"expert.{remap[old]}.{suffix}"] = params[f"expert.{old}.{suffix}"]
     R = params["router"]
-    new_params["router"] = R[:, keep].clone()
+    R = R.data if isinstance(R, Tensor) else np.asarray(R)
+    new_params["router"] = R[:, keep].copy()
     opt_state = blob["opt_state"]
     new_opt = {k: v for k, v in opt_state.items()
                if not (k.startswith("expert.") and int(k.split(".")[1]) in removed)}
@@ -81,6 +83,7 @@ def prune_checkpoint(ckpt_dir: str, rm_worst: int, eval_batches, min_samples: in
     blob2 = _ckpt.load_checkpoint(ckpt_dir)
     m2 = _model.Model(spec, blob2["params"], mtp_depth=mtp_depth)
     logits, _ = m2.forward([65, 66, 67, 68], train=False)
-    if not torch.isfinite(logits).all().item():
+    logits = logits.data if isinstance(logits, Tensor) else np.asarray(logits)
+    if not np.isfinite(logits).all():
         raise RuntimeError("pruned model failed validation")
     return report
