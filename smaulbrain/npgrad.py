@@ -150,8 +150,14 @@ class Tensor:
         return Tensor(np.ascontiguousarray(self.data), self.requires_grad)
 
     def to(self, dtype=None, device=None, **kwargs):
-        if dtype is not None and np.dtype(dtype) != self.data.dtype:
-            return Tensor(self.data.astype(dtype), self.requires_grad)
+        if dtype is not None:
+            dtype = np.dtype(dtype)
+            if dtype != self.data.dtype:
+                if (np.issubdtype(dtype, np.floating)
+                        and np.issubdtype(self.data.dtype, np.floating)):
+                    out = self.data.astype(dtype)
+                    return make_op(out, (self,), lambda g: (g.astype(self.data.dtype),))
+                return Tensor(self.data.astype(dtype), self.requires_grad)
         return self
 
     def float(self):
@@ -390,7 +396,7 @@ def _unbroadcast(grad, shape):
     for axis, size in enumerate(shape):
         if size == 1 and grad.shape[axis] != 1:
             grad = grad.sum(axis=axis, keepdims=True)
-    return grad
+    return grad.reshape(shape)
 
 
 def make_op(data, inputs, backward):
