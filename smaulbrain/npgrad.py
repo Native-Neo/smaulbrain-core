@@ -175,11 +175,17 @@ class Tensor:
         return self.reshape(*shape)
 
     def unsqueeze(self, dim):
+        if dim < 0:
+            dim += self.ndim + 1
         return reshape(self, self.shape[:dim] + (1,) + self.shape[dim:])
 
     def squeeze(self, dim=None):
         if dim is None:
             return reshape(self, tuple(s for s in self.shape if s != 1))
+        if dim < 0:
+            dim += self.ndim
+        if self.shape[dim] != 1:
+            return self
         return reshape(self, self.shape[:dim] + self.shape[dim + 1:])
 
     def transpose(self, dim0, dim1):
