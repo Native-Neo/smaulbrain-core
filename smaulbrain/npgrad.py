@@ -1078,6 +1078,8 @@ class Module:
                 continue
             seen.add(id(value))
             yield full, value
+            if kind in ("parameters", "buffers"):
+                yield from value._named(full + ".", seen, kind)
 
     def named_parameters(self, prefix=""):
         return self._named(prefix, kind="parameters")
