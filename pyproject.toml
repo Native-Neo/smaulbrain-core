@@ -17,7 +17,7 @@ keywords = [
     "moe",
     "quantization",
     "ternary",
-    "pytorch",
+    "numpy",
     "byte-level",
 ]
 classifiers = [
