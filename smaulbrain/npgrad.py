@@ -192,10 +192,18 @@ class Tensor:
             axes = tuple(axes[0])
         return transpose(self, tuple(axes))
 
-    def mean(self, dim=None, keepdim=False):
+    def mean(self, dim=None, keepdim=False, axis=None, keepdims=None):
+        if axis is not None:
+            dim = axis
+        if keepdims is not None:
+            keepdim = keepdims
         return mean(self, axis=dim, keepdims=keepdim)
 
-    def sum(self, dim=None, keepdim=False, dtype=None):
+    def sum(self, dim=None, keepdim=False, dtype=None, axis=None, keepdims=None):
+        if axis is not None:
+            dim = axis
+        if keepdims is not None:
+            keepdim = keepdims
         out = sum(self, axis=dim, keepdims=keepdim)
         if dtype is not None and np.dtype(dtype) != out.dtype:
             return Tensor(out.data.astype(dtype), out.requires_grad)
