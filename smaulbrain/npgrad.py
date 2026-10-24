@@ -141,7 +141,7 @@ class Tensor:
         return Tensor(self.data.copy(), self.requires_grad)
 
     def clone(self):
-        return copy(self)
+        return Tensor(self.data.copy(), self.requires_grad)
 
     def detach(self):
         return Tensor(self.data, False)
