@@ -379,9 +379,14 @@ class Parameter(Tensor):
 def as_tensor(value, dtype=None):
     if isinstance(value, Tensor):
         return value if dtype is None else value.to(dtype=dtype)
-    arr = np.asarray(value)
-    if dtype is not None:
-        arr = arr.astype(dtype)
+    if dtype is None and isinstance(value, float):
+        # Match PyTorch's weak Python scalars: float constants do not promote
+        # float32 activations to float64.
+        arr = np.asarray(value, dtype=DTYPE)
+    else:
+        arr = np.asarray(value)
+        if dtype is not None:
+            arr = arr.astype(dtype)
     return Tensor(arr, False)
 
 
