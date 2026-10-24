@@ -1062,24 +1062,21 @@ class Module:
 
     def _named(self, prefix="", seen=None, kind="parameters"):
         seen = seen if seen is not None else set()
-        if kind == "parameters":
-            store = self._parameters
-        elif kind == "buffers":
-            store = self._buffers
-        else:
-            store = self._modules
-        for name, value in store.items():
-            full = f"{prefix}{name}"
-            if kind == "modules":
+        if kind == "modules":
+            for name, value in self._modules.items():
+                full = f"{prefix}{name}"
                 yield full, value
                 yield from value._named(full + ".", seen, kind)
-                continue
+            return
+        store = self._parameters if kind == "parameters" else self._buffers
+        for name, value in store.items():
+            full = f"{prefix}{name}"
             if id(value) in seen:
                 continue
             seen.add(id(value))
             yield full, value
-            if kind in ("parameters", "buffers"):
-                yield from value._named(full + ".", seen, kind)
+        for name, value in self._modules.items():
+            yield from value._named(f"{prefix}{name}.", seen, kind)
 
     def named_parameters(self, prefix=""):
         return self._named(prefix, kind="parameters")
