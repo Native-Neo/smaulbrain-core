@@ -1040,3 +1040,26 @@ extern "C" int smaulbrain_pack_ternary_tiled(
     return smaulbrain_retile_ternary(lin.data(), out, din, dout);
 #endif
 }
+
+// Pack a batch of matrices with one FFI crossing. The per-matrix pack routine
+// is unchanged, so scales, thresholds, and codes are identical to individual
+// calls. `weights` points at an array of float pointers; `sizes` is the packed
+// byte count for each matrix, and the outputs are contiguous in that order.
+extern "C" int smaulbrain_pack_ternary_tiled_many(
+    const void* weights, std::uint8_t* out, const std::size_t* sizes,
+    const std::size_t* dins, const std::size_t* douts,
+    float* scales, float* thresholds, std::size_t count) noexcept {
+    if (count == 0) return 0;
+    if (!weights || !out || !sizes || !dins || !douts || !scales || !thresholds)
+        return 1;
+    const float* const* ws = static_cast<const float* const*>(weights);
+    std::size_t offset = 0;
+    for (std::size_t i = 0; i < count; ++i) {
+        if (sizes[i] == 0) return 1;
+        const int status = smaulbrain_pack_ternary_tiled(
+            ws[i], out + offset, dins[i], douts[i], &scales[i], &thresholds[i]);
+        if (status != 0) return status;
+        offset += sizes[i];
+    }
+    return 0;
+}
