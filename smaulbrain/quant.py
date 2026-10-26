@@ -59,11 +59,22 @@ def pack_ternary(W):
 def pack_ternary_tiled(W):
     a = _np(W, np.float32)
     packed, scale, shape, threshold = _native.pack_ternary_tiled(a)
-    if isinstance(packed, TiledPacked):
-        packed = TiledPacked(packed.buf.copy())
-    else:
-        packed = np.array(packed, copy=True, dtype=np.uint8)
+    # The native path allocates a fresh tiled buffer, and the fallback has
+    # already passed through pack_ternary(), which copies. No second copy is
+    # needed; callers own the returned buffer.
     return packed, float(scale), tuple(shape), float(threshold)
+
+
+def pack_ternary_tiled_many(weights):
+    """Pack multiple 2-D matrices with one native call when available.
+
+    The returned packed buffers share one freshly allocated array, so callers
+    must not assume they own separate allocations. Their per-matrix values are
+    identical to :func:`pack_ternary_tiled`, and no dense weights are
+    materialized.
+    """
+    arrays = [_np(w, np.float32) for w in weights]
+    return _native.pack_ternary_tiled_many(arrays)
 
 
 def unpack_codes(packed, shape):
