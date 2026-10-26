@@ -768,30 +768,39 @@ extern "C" int smaulbrain_tiled_matmat(
     std::size_t batch, std::size_t din, std::size_t dout) noexcept {
     if (!x || !tiled || !y || din == 0 || dout == 0) return 1;
     const std::size_t ntiles = (dout + 15) / 16;
+    // Partition both output tiles and batch rows. Output rows are independent,
+    // so batch blocks can run concurrently while each tile keeps its packed
+    // weight bytes hot in cache. Small per-tile work often misses the old
+    // one-million-MAC cutoff even though the whole call benefits from threads.
+    constexpr std::size_t kBatchBlock = 64;
+    const std::size_t nblocks = (batch + kBatchBlock - 1) / kBatchBlock;
+    const std::size_t nitems = ntiles * nblocks;
 #if defined(__AVX__)
     const MaskLut& L = mask_lut();
-    auto do_tile = [&](std::size_t t) {
+    auto do_item = [&](std::size_t item) {
+        const std::size_t t = item / nblocks;
+        const std::size_t bi = item % nblocks;
         const std::size_t j0 = t * 16;
         const std::size_t valid = std::min<std::size_t>(16, dout - j0);
         const std::uint8_t* tile = tiled + t * din * 4;
-        for (std::size_t b0 = 0; b0 < batch;) {
-            const std::size_t left = batch - b0;
-            const std::size_t bt = left >= 4 ? 4 : left;
-            switch (bt) {
-                case 4: tiled_fwd_tile<4>(L, x, tile, scale, y, b0, din, dout, j0, valid); break;
-                case 3: tiled_fwd_tile<3>(L, x, tile, scale, y, b0, din, dout, j0, valid); break;
-                case 2: tiled_fwd_tile<2>(L, x, tile, scale, y, b0, din, dout, j0, valid); break;
-                default: tiled_fwd_tile<1>(L, x, tile, scale, y, b0, din, dout, j0, valid); break;
-            }
-            b0 += bt;
-        }
+        const std::size_t b0 = bi * kBatchBlock;
+        const std::size_t bend = std::min(batch, b0 + kBatchBlock);
+        std::size_t b = b0;
+        for (; b + 4 <= bend; b += 4)
+            tiled_fwd_tile<4>(L, x, tile, scale, y, b, din, dout, j0, valid);
+        for (; b < bend; ++b)
+            tiled_fwd_tile<1>(L, x, tile, scale, y, b, din, dout, j0, valid);
     };
 #else
-    auto do_tile = [&](std::size_t t) {
+    auto do_item = [&](std::size_t item) {
+        const std::size_t t = item / nblocks;
+        const std::size_t bi = item % nblocks;
         const std::size_t j0 = t * 16;
         const unsigned valid = static_cast<unsigned>(std::min<std::size_t>(16, dout - j0));
         const std::uint8_t* tile = tiled + t * din * 4;
-        for (std::size_t b = 0; b < batch; ++b) {
+        const std::size_t b0 = bi * kBatchBlock;
+        const std::size_t bend = std::min(batch, b0 + kBatchBlock);
+        for (std::size_t b = b0; b < bend; ++b) {
             for (unsigned c = 0; c < valid; ++c) {
                 float acc = 0.0f;
                 for (std::size_t i = 0; i < din; ++i) acc += x[b * din + i] * tiled_weight(tile, i, c);
@@ -800,10 +809,11 @@ extern "C" int smaulbrain_tiled_matmat(
         }
     };
 #endif
-    if (worth_threads(batch * din * dout)) {
-        Pool::get().run(ntiles, std::function<void(std::size_t)>(do_tile));
+    const std::size_t macs = batch * din * dout;
+    if (nitems > 1 && macs >= (std::size_t{1} << 16)) {
+        Pool::get().run(nitems, std::function<void(std::size_t)>(do_item));
     } else {
-        for (std::size_t t = 0; t < ntiles; ++t) do_tile(t);
+        for (std::size_t item = 0; item < nitems; ++item) do_item(item);
     }
     return 0;
 }
@@ -814,24 +824,40 @@ extern "C" int smaulbrain_tiled_transpose_matmat(
     if (!dy || !tiled || !dx || din == 0 || dout == 0) return 1;
     const std::size_t ntiles = (dout + 15) / 16;
     const std::size_t pw = ntiles * 16;
-    // dy padded to whole tiles once: [batch][ntiles*16].
-    std::vector<float> dyp(batch * pw, 0.0f);
-    for (std::size_t b = 0; b < batch; ++b)
-        std::copy(dy + b * dout, dy + (b + 1) * dout, dyp.data() + b * pw);
-    // Each work item owns a disjoint range of input rows i, so dx writes never
-    // overlap between threads. Every tile is streamed sequentially per range.
-    constexpr std::size_t kRows = 64;
-    const std::size_t nitems = (din + kRows - 1) / kRows;
-    auto do_range = [&](std::size_t item) {
-        const std::size_t i0 = item * kRows;
-        const std::size_t i1 = std::min(din, i0 + kRows);
+    // Most model shapes are already whole 16-column tiles, so reading dy
+    // directly avoids an allocation and a full copy on every backward call.
+    const bool aligned = (dout & 15u) == 0u;
+    std::vector<float> dyp;
+    const float* dyr = dy;
+    if (!aligned) {
+        dyp.assign(batch * pw, 0.0f);
         for (std::size_t b = 0; b < batch; ++b)
-            std::fill(dx + b * din + i0, dx + b * din + i1, 0.0f);
+            std::copy(dy + b * dout, dy + (b + 1) * dout, dyp.data() + b * pw);
+        dyr = dyp.data();
+    }
+    // Work items own disjoint (batch block, input row block) rectangles, so
+    // dx writes never overlap. Batch blocking keeps each input-gradient row
+    // group's dy slice in L1 and gives small din values more than one row item
+    // to spread across the pool. The 32-row blocks win for wide outputs where
+    // dy is the larger stream; 64 rows use less weight-decode work for the
+    // narrow-output shapes.
+    const std::size_t bblock = (din <= 32 && dout > 32) ? 32 : 64;
+    constexpr std::size_t kRows = 64;
+    const std::size_t n_i = (din + kRows - 1) / kRows;
+    const std::size_t n_b = (batch + bblock - 1) / bblock;
+    const std::size_t nitems = n_i * n_b;
+    auto do_range = [&](std::size_t item) {
+        const std::size_t bi = item / n_i;
+        const std::size_t ii = item % n_i;
+        const std::size_t b0 = bi * bblock;
+        const std::size_t b1 = std::min(batch, b0 + bblock);
+        const std::size_t i0 = ii * kRows;
+        const std::size_t i1 = std::min(din, i0 + kRows);
 #if defined(__AVX__)
         const MaskLut& L = mask_lut();
         for (std::size_t t = 0; t < ntiles; ++t) {
             const std::uint8_t* tile = tiled + t * din * 4;
-            const float* dyt = dyp.data() + t * 16;
+            const float* dyt = dyr + t * 16;
             std::size_t i = i0;
             for (; i + 4 <= i1; i += 4) {
                 __m256 w0[4], w1[4];
@@ -840,7 +866,7 @@ extern "C" int smaulbrain_tiled_transpose_matmat(
                     w0[r] = dec8(L, p);
                     w1[r] = dec8(L, p + 2);
                 }
-                for (std::size_t b = 0; b < batch; ++b) {
+                for (std::size_t b = b0; b < b1; ++b) {
                     const __m256 d0 = _mm256_loadu_ps(dyt + b * pw);
                     const __m256 d1 = _mm256_loadu_ps(dyt + b * pw + 8);
                     __m256 a[4];
@@ -851,36 +877,43 @@ extern "C" int smaulbrain_tiled_transpose_matmat(
                     const __m128 sm = _mm_add_ps(_mm256_castps256_ps128(h),
                                                  _mm256_extractf128_ps(h, 1));
                     float* o = dx + b * din + i;
-                    _mm_storeu_ps(o, _mm_add_ps(_mm_loadu_ps(o), sm));
+                    if (t == 0) _mm_storeu_ps(o, sm);
+                    else _mm_storeu_ps(o, _mm_add_ps(_mm_loadu_ps(o), sm));
                 }
             }
             for (; i < i1; ++i) {
                 const std::uint8_t* p = tile + i * 4;
                 const __m256 w0 = dec8(L, p), w1 = dec8(L, p + 2);
-                for (std::size_t b = 0; b < batch; ++b) {
+                for (std::size_t b = b0; b < b1; ++b) {
                     const __m256 d0 = _mm256_loadu_ps(dyt + b * pw);
                     const __m256 d1 = _mm256_loadu_ps(dyt + b * pw + 8);
-                    dx[b * din + i] += horizontal_sum(
+                    const float sm = horizontal_sum(
                         _mm256_add_ps(_mm256_mul_ps(d0, w0), _mm256_mul_ps(d1, w1)));
+                    float* o = dx + b * din + i;
+                    if (t == 0) *o = sm;
+                    else *o += sm;
                 }
             }
         }
 #else
         for (std::size_t t = 0; t < ntiles; ++t) {
             const std::uint8_t* tile = tiled + t * din * 4;
-            const float* dyt = dyp.data() + t * 16;
+            const float* dyt = dyr + t * 16;
             for (std::size_t i = i0; i < i1; ++i)
-                for (std::size_t b = 0; b < batch; ++b) {
+                for (std::size_t b = b0; b < b1; ++b) {
                     float acc = 0.0f;
                     for (unsigned c = 0; c < 16; ++c) acc += dyt[b * pw + c] * tiled_weight(tile, i, c);
-                    dx[b * din + i] += acc;
+                    float* o = dx + b * din + i;
+                    if (t == 0) *o = acc;
+                    else *o += acc;
                 }
         }
 #endif
-        for (std::size_t b = 0; b < batch; ++b)
+        for (std::size_t b = b0; b < b1; ++b)
             for (std::size_t i = i0; i < i1; ++i) dx[b * din + i] *= scale;
     };
-    if (worth_threads(batch * din * dout)) {
+    const std::size_t macs = batch * din * dout;
+    if (nitems > 1 && macs >= (std::size_t{1} << 16)) {
         Pool::get().run(nitems, std::function<void(std::size_t)>(do_range));
     } else {
         for (std::size_t item = 0; item < nitems; ++item) do_range(item);
