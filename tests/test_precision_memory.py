@@ -345,6 +345,28 @@ def test_quantized_activation_loss_close_to_fp32(mode):
     assert abs(quantized - reference) <= 0.02 * abs(reference) + 0.05
 
 
+@pytest.mark.parametrize("mode", ["fp32", "bf16", "int8"])
+def test_silu_inplace_matches_allocating_reference(mode):
+    rng = np.random.default_rng(17)
+    values = (rng.standard_normal((41, 29)) * 3.0).astype(np.float32)
+    x = ng.Tensor(values, requires_grad=True)
+    with P.activation_storage(mode):
+        y = ng.silu(x)
+    y.backward(np.ones_like(y.data))
+    if mode == "fp32":
+        x64 = values.astype(np.float64)
+        sig = 1.0 / (1.0 + np.exp(-x64))
+        want = (x64 * sig).astype(np.float32)
+        grad = (sig * (1.0 + x64 * (1.0 - sig))).astype(np.float32)
+    else:
+        sig = 1.0 / (1.0 + np.exp(-values))
+        want = (values * sig).astype(np.float32)
+        grad = (sig * (1.0 + values * (1.0 - sig))).astype(np.float32)
+        want = P.StoredArray.compress(want, mode).dequantize()
+    np.testing.assert_array_equal(y.data, want)
+    np.testing.assert_array_equal(x.grad, grad)
+
+
 @pytest.mark.parametrize("op", ["matmul", "silu", "gelu", "softplus"])
 def test_op_closures_do_not_retain_full_size_float32_copies(op):
     """Compressed ops must decode operands in backward instead of capturing them."""
