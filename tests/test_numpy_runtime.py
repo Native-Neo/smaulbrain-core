@@ -28,6 +28,32 @@ def test_npgrad_broadcast_and_dtype_cast():
     np.testing.assert_allclose(z.grad, np.ones((2, 3)))
 
 
+def test_index_add_rows_many_matches_sequential_forward_backward():
+    rng = np.random.default_rng(26)
+    ids_a, ids_b = np.array([0, 2, 3]), np.array([1, 2, 3])
+    data_a = rng.standard_normal((3, 4)).astype(np.float32)
+    data_b = rng.standard_normal((3, 4)).astype(np.float32)
+    upstream = rng.standard_normal((5, 4)).astype(np.float32)
+
+    def run(batched):
+        base = ng.Tensor(np.zeros((5, 4), dtype=np.float32))
+        a = ng.Tensor(data_a.copy(), requires_grad=True)
+        b = ng.Tensor(data_b.copy(), requires_grad=True)
+        if batched:
+            out = ng.index_add_rows_many(base, [(ids_a, a), (ids_b, b)])
+        else:
+            out = ng.index_add_rows(ng.index_add_rows(base, ids_a, a), ids_b, b)
+        return out, (a, b)
+
+    fast, fast_sources = run(True)
+    ref, ref_sources = run(False)
+    np.testing.assert_array_equal(fast.data, ref.data)
+    fast.backward(upstream)
+    ref.backward(upstream)
+    for got, want in zip(fast_sources, ref_sources):
+        np.testing.assert_array_equal(got.grad, want.grad)
+
+
 def test_scan_matches_explicit_recurrence():
     rng = np.random.default_rng(0)
     values = rng.standard_normal((2, 5, 4)).astype(np.float32)
@@ -315,6 +341,42 @@ def test_model_forward_backward(preset):
     opt.register(m.p)
     opt.step(m.p, grads)
     assert opt.n_updates == 1
+
+
+def test_loss_backward_returns_gradient_buffers_without_copying(monkeypatch):
+    spec = cfg.PRESETS["dense-tiny"]
+    m = model.Model(spec, model.build_params(spec, np.random.default_rng(27)))
+    original_zero_grad = m.zero_grad
+    captured = {}
+
+    def capture_before_clear(*args, **kwargs):
+        current = {k: v.grad for k, v in m.p.items() if v.grad is not None}
+        if current:
+            captured.update(current)
+        return original_zero_grad(*args, **kwargs)
+
+    monkeypatch.setattr(m, "zero_grad", capture_before_clear)
+    loss, grads, _ = m.loss_and_backward(
+        np.random.default_rng(28).integers(0, 256, 8).tolist())
+    assert np.isfinite(loss)
+    assert grads and grads.keys() == captured.keys()
+    assert all(grads[name] is captured[name] for name in grads)
+    assert all(parameter.grad is None for parameter in m.p.values())
+    assert all(np.isfinite(grad).all() for grad in grads.values())
+
+
+def test_moe_reduced_precision_keeps_sequential_aggregation(monkeypatch):
+    spec = cfg.PRESETS["moe-tiny"]
+    m = model.Model(spec, model.build_params(spec, np.random.default_rng(29)),
+                    activation_storage="bf16")
+
+    def unexpected_batch(*args, **kwargs):
+        pytest.fail("reduced-precision MoE must preserve sequential rounding")
+
+    monkeypatch.setattr(ng, "index_add_rows_many", unexpected_batch)
+    logits, _ = m.forward(
+        np.random.default_rng(30).integers(0, 256, 8).tolist(), train=True)
+    assert np.isfinite(logits.data).all()
 
 
 def test_ternary_training_prefetches_invalidated_weights():

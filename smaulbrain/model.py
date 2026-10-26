@@ -434,6 +434,7 @@ class Model:
             idx, weights, info = self._route(
                 X, top_k, None if no_drop else self.capacity_factor, disabled)
         Y = Tensor(np.zeros_like(X.data))
+        updates = []
         flat = idx.reshape(-1)
         order = np.argsort(flat, kind="stable")
         counts = np.bincount(flat[order], minlength=p["router"].shape[1])
@@ -450,10 +451,17 @@ class Model:
             try:
                 yb = self._expert(X[rows], eid)
                 wt = weights[rows, cols].reshape(-1, 1)
-                Y = ng.index_add_rows(Y, rows, wt * yb)
+                updates.append((rows, wt * yb))
             finally:
                 if self.store is not None:
                     self.store.unpin(eid)
+        if self.activation_storage == "fp32":
+            if updates:
+                Y = ng.index_add_rows_many(Y, updates)
+        else:
+            # Preserve per-expert storage rounding in BF16/INT8 modes.
+            for rows, contribution in updates:
+                Y = ng.index_add_rows(Y, rows, contribution)
         return Y, info
 
     @staticmethod
@@ -573,10 +581,9 @@ class Model:
                     target.grad = _precision.store_gradient(
                         _precision.gradient_array(target.grad) + merged,
                         self.gradient_storage)
-        if self.gradient_storage == "bf16":
-            grads = {k: v.grad for k, v in p.items() if v.grad is not None}
-        else:
-            grads = {k: v.grad.copy() for k, v in p.items() if v.grad is not None}
+        # Keep the completed buffers alive through the returned dict; clearing
+        # Parameter.grad below only drops references and does not mutate them.
+        grads = {k: v.grad for k, v in p.items() if v.grad is not None}
         out = float(loss.detach().item())
         aux = dict(self._last_aux)
         aux["loss_main"] = float(loss_main.detach().item())
