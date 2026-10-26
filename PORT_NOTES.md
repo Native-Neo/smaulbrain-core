@@ -149,6 +149,18 @@ under `tests/_reference/` as a development oracle for parity checks.
   nonzeros, packed four codes per byte. Packed matmul avoids reconstructing a
   dense weight matrix. The optional C++ kernel and the portable NumPy path use
   the same layout; the fallback is used when no compiler is available.
+- **Packed ternary throughput.** The tiled kernels now partition both output
+  tiles and batch/input-row blocks, so narrow matrices use more than one
+  worker. Backward reads `dY` directly for 16-column-aligned outputs instead of
+  allocating a padded copy, and the first input-gradient tile initializes `dx`
+  instead of zero-filling and then reading it back. The Python bridge passes
+  raw tensor addresses to the hot tiled/packing entry points to avoid per-call
+  `ctypes` cast objects. Quantized linear backward computes the FP32 STE weight
+  gradient before the packed dX kernel so native worker spin does not compete
+  with the following BLAS GEMM. These changes alter scheduling and copies only;
+  the per-output arithmetic and packed format are unchanged. On dense-tiny at
+  sequence 512 the packed dX kernel is 1.4-2.8x faster than the parent commit,
+  while the STE weight GEMM remains FP32 and sets the backward floor.
 - **SmaulOPT.** The factored optimizer keeps the original first moment and
   row/column second-moment structure. The optional fused C++ update is reached
   through NumPy buffers; without a compiler or for non-qualifying tensors the
