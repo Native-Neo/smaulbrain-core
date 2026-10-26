@@ -42,9 +42,42 @@ def _measure(spec, tokens, forward_quant, backward_mode, args):
     params = M.build_params(spec, np.random.default_rng(args.seed),
                             spec.n_experts_init, mtp_depth=args.mtp_depth)
     model = M.Model(spec, params, forward_quant=forward_quant,
-                    backward_mode=backward_mode, mtp_depth=args.mtp_depth)
+                    backward_mode=backward_mode, mtp_depth=args.mtp_depth,
+                    activation_storage=args.activation_storage,
+                    gradient_storage=args.gradient_storage)
     opt = optmod.SmaulOPT(lr=args.lr)
     opt.register(model.p)
+
+    pack_state = {"pack_s": 0.0, "cache_get_s": 0.0, "pack_builds": 0}
+    if args.profile_phases:
+        original_get = model.packed.get
+        original_prefetch = model.packed.prefetch
+
+        def timed_get(key, weight):
+            before = model.packed.builds
+            started = time.perf_counter()
+            result = original_get(key, weight)
+            elapsed = time.perf_counter() - started
+            pack_state["cache_get_s"] += elapsed
+            if model.packed.builds != before:
+                pack_state["pack_s"] += elapsed
+                pack_state["pack_builds"] += 1
+            return result
+
+        def timed_prefetch(*args, **kwargs):
+            before = model.packed.builds
+            started = time.perf_counter()
+            result = original_prefetch(*args, **kwargs)
+            elapsed = time.perf_counter() - started
+            pack_state["cache_get_s"] += elapsed
+            built = model.packed.builds - before
+            if built:
+                pack_state["pack_s"] += elapsed
+                pack_state["pack_builds"] += built
+            return result
+
+        model.packed.get = timed_get
+        model.packed.prefetch = timed_prefetch
 
     update = not args.frozen_weights
     for _ in range(args.warmup):
@@ -67,15 +100,26 @@ def _measure(spec, tokens, forward_quant, backward_mode, args):
 
     records = []
     for _ in range(args.steps):
+        if args.profile_phases:
+            pack_state["pack_s"] = 0.0
+            pack_state["cache_get_s"] = 0.0
+            pack_state["pack_builds"] = 0
         wall0 = time.perf_counter()
         cpu0 = time.process_time()
         loss, grads, info = model.loss_and_backward(tokens, profile=True)
         wall1 = time.perf_counter()
         cpu1 = time.process_time()
+        optimizer_s = 0.0
+        invalidate_s = 0.0
         if update:
+            mark = time.perf_counter()
             opt.step(model.p, grads, collect_norms=False)
+            middle = time.perf_counter()
             model.packed.invalidate(grads.keys())
             model.fp8.invalidate(grads.keys())
+            end = time.perf_counter()
+            optimizer_s = middle - mark
+            invalidate_s = end - middle
         wall2 = time.perf_counter()
         cpu2 = time.process_time()
         profile = info["profile"]
@@ -85,11 +129,18 @@ def _measure(spec, tokens, forward_quant, backward_mode, args):
             "backward_s": float(profile["backward_s"]),
             "step_s": float(wall2 - wall0),
             "step_cpu_s": float(cpu2 - cpu0),
+            "optimizer_s": float(optimizer_s),
+            "invalidate_s": float(invalidate_s),
             # Gradients are copied out of the graph after the profiled
             # backward; this is the remaining part of the step.
             "grad_extract_s": float((wall1 - wall0)
                                     - profile["forward_s"]
                                     - profile["backward_s"]),
+            "pack_s": float(pack_state["pack_s"]) if args.profile_phases else None,
+            "pack_builds": (int(pack_state["pack_builds"])
+                            if args.profile_phases else None),
+            "cache_get_s": (float(pack_state["cache_get_s"])
+                            if args.profile_phases else None),
         })
 
     metrics = {
@@ -97,7 +148,15 @@ def _measure(spec, tokens, forward_quant, backward_mode, args):
         "backward_s": _median([r["backward_s"] for r in records]),
         "step_s": _median([r["step_s"] for r in records]),
         "step_cpu_s": _median([r["step_cpu_s"] for r in records]),
+        "optimizer_s": _median([r["optimizer_s"] for r in records]),
+        "invalidate_s": _median([r["invalidate_s"] for r in records]),
         "grad_extract_s": _median([r["grad_extract_s"] for r in records]),
+        "pack_s": (_median([r["pack_s"] for r in records])
+                   if args.profile_phases else None),
+        "pack_builds": (_median([r["pack_builds"] for r in records])
+                        if args.profile_phases else None),
+        "cache_get_s": (_median([r["cache_get_s"] for r in records])
+                        if args.profile_phases else None),
         "first_loss": records[0]["loss"],
         "last_loss": records[-1]["loss"],
         "samples": records,
@@ -131,7 +190,7 @@ def _aggregate(runs):
         for mode, metrics in seq["modes"].items():
             aggregated = {}
             for key, value in metrics.items():
-                if key in ("first_loss", "last_loss", "samples"):
+                if key in ("first_loss", "last_loss", "samples") or value is None:
                     aggregated[key] = value
                 else:
                     aggregated[key] = _median(
@@ -165,6 +224,13 @@ def main():
                     choices=sorted(MODES))
     ap.add_argument("--frozen-weights", action="store_true",
                     help="do not run the optimizer or invalidate packed weights")
+    ap.add_argument("--activation-storage", default="fp32",
+                    choices=["fp32", "bf16", "int8"])
+    ap.add_argument("--gradient-storage", default="fp32",
+                    choices=["fp32", "bf16"])
+    ap.add_argument("--profile-phases", action="store_true",
+                    help="time packed-cache rebuilds separately; adds a small "
+                         "Python wrapper around lookups and prefetch")
     ap.add_argument("--seed", type=int, default=1234)
     ap.add_argument("--mtp-depth", type=int, default=0)
     ap.add_argument("--lr", type=float, default=3e-4)
@@ -200,6 +266,9 @@ def main():
         "seed": args.seed,
         "mtp_depth": args.mtp_depth,
         "frozen_weights": bool(args.frozen_weights),
+        "activation_storage": args.activation_storage,
+        "gradient_storage": args.gradient_storage,
+        "profile_phases": bool(args.profile_phases),
         "steps": args.steps,
         "warmup": args.warmup,
         "runs": args.runs,
