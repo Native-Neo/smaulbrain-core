@@ -230,6 +230,76 @@ def test_batched_native_optimizer_matches_single_matrix_path(monkeypatch):
         assert batch_norms[name] == single_norms[name]
 
 
+def test_smaulopt_rejects_unknown_gradient_without_updating():
+    rng = np.random.default_rng(24)
+    w = rng.standard_normal((6,)).astype(np.float32)
+    before = w.copy()
+    opt = smaulopt.SmaulOPT(lr=1e-3)
+    opt.register({"w": w})
+    with pytest.raises(ValueError, match="unknown SmaulOPT parameter"):
+        opt.step({"w": w}, {"w": np.ones_like(w), "missing": np.ones(3)})
+    np.testing.assert_array_equal(w, before)
+    assert opt.n_updates == 0
+    np.testing.assert_array_equal(opt.state["w"]["m"], np.zeros_like(w))
+
+
+def test_smaulopt_step_is_atomic_on_invalid_inputs():
+    rng = np.random.default_rng(25)
+    params = {
+        "a": rng.standard_normal((7,)).astype(np.float32),
+        "b": rng.standard_normal((6, 8)).astype(np.float32),
+    }
+    before = {name: value.copy() for name, value in params.items()}
+    grads = {
+        "a": np.ones_like(params["a"]),
+        "b": rng.standard_normal((5, 8)).astype(np.float32),
+    }
+    opt = smaulopt.SmaulOPT(lr=1e-3)
+    opt.register(params)
+    with pytest.raises(ValueError, match="shape"):
+        opt.step(params, grads)
+    for name, value in params.items():
+        np.testing.assert_array_equal(value, before[name])
+    assert opt.n_updates == 0
+    for state in opt.state.values():
+        np.testing.assert_array_equal(state["m"], np.zeros_like(state["m"]))
+
+    grads["b"] = np.ones_like(params["b"])
+    grads["a"][0] = np.nan
+    with pytest.raises(FloatingPointError, match="non-finite"):
+        opt.step(params, grads)
+    for name, value in params.items():
+        np.testing.assert_array_equal(value, before[name])
+    assert opt.n_updates == 0
+
+    grads["a"][0] = 1.0
+    opt.state["b"]["R"] = opt.state["b"]["R"][:-1]
+    with pytest.raises(ValueError, match="state"):
+        opt.step(params, grads)
+    for name, value in params.items():
+        np.testing.assert_array_equal(value, before[name])
+    assert opt.n_updates == 0
+
+
+def test_smaulopt_load_state_dict_validates_layout_atomically():
+    opt = smaulopt.SmaulOPT()
+    good = {"w": {"m": np.zeros((2, 3), np.float32),
+                  "R": np.zeros(2, np.float32),
+                  "C": np.zeros(3, np.float32)}}
+    opt.load_state_dict(good)
+    assert opt.state["w"]["factored"] is True
+
+    opt = smaulopt.SmaulOPT()
+    with pytest.raises(ValueError, match="both 'R' and 'C'"):
+        opt.load_state_dict({"w": {"m": np.zeros((2, 3), np.float32),
+                                   "R": np.zeros(2, np.float32)}})
+    assert opt.state == {}
+
+    with pytest.raises(ValueError, match="factored_flags"):
+        opt.load_state_dict(good, {"w": False})
+    assert opt.state == {}
+
+
 @pytest.mark.parametrize("preset", ["dense-tiny", "moe-tiny"])
 def test_model_forward_backward(preset):
     spec = cfg.PRESETS[preset]
