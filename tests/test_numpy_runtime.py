@@ -365,6 +365,20 @@ def test_loss_backward_returns_gradient_buffers_without_copying(monkeypatch):
     assert all(np.isfinite(grad).all() for grad in grads.values())
 
 
+def test_moe_reduced_precision_keeps_sequential_aggregation(monkeypatch):
+    spec = cfg.PRESETS["moe-tiny"]
+    m = model.Model(spec, model.build_params(spec, np.random.default_rng(29)),
+                    activation_storage="bf16")
+
+    def unexpected_batch(*args, **kwargs):
+        pytest.fail("reduced-precision MoE must preserve sequential rounding")
+
+    monkeypatch.setattr(ng, "index_add_rows_many", unexpected_batch)
+    logits, _ = m.forward(
+        np.random.default_rng(30).integers(0, 256, 8).tolist(), train=True)
+    assert np.isfinite(logits.data).all()
+
+
 def test_ternary_training_prefetches_invalidated_weights():
     spec = cfg.PRESETS["dense-tiny"]
     m = model.Model(spec, model.build_params(spec, np.random.default_rng(93)),
