@@ -81,7 +81,10 @@ under `tests/_reference/` as a development oracle for parity checks.
     generalization, not a faithful port, and was not beneficial in the CPU
     tests.
   - **Performance.** Perturbed forwards use float32 nonlinearities while the
-    clean forward retains the reference float64 intermediates. Hub/writer/
+    clean forward retains the reference float64 intermediates. Its single-
+    sequence recurrent scan uses the same native kernel as `npgrad.scan` when
+    available, so the clean forward stays on the same scan path as
+    `Model.forward`; batched perturbed scans keep the chunked path. Hub/writer/
     hidden groups at each layer are evaluated as one batch with zeros outside
     the current group's sites; this is algebraically identical to three
     separate forwards and is tested bitwise. The head uses an adaptive float32
@@ -134,10 +137,16 @@ under `tests/_reference/` as a development oracle for parity checks.
   cross-entropy plus optional MTP cross-entropy; there is no reconstruction or
   weight-quantization loss term in this repository to preserve, reweight, or
   benchmark.
-- **Recurrent scan.** The original time loop / native scan is replaced by a
-  chunked closed-form scan (`npgrad.scan`). The chunk size adapts to the decay
-  range, so summation order differs from a token-by-token loop. The math is the
-  same, and the scan is parity-tested against PyTorch.
+- **Recurrent scan.** The chunked closed-form scan remains the portable
+  reference and handles batched/3-D values, explicit initial states, non-fp32
+  or non-contiguous inputs, and systems without a compiler. The common 2-D
+  contiguous float32 training case (`npgrad.scan` with no `s0`) uses the native
+  sequential recurrence. Its summation order differs in the last bits; the
+  integration test compares it with the closed form at `2e-6`, and
+  finite-difference tests exercise the native backward scan. The backend is
+  loaded lazily from `scan`, so results do not depend on which model mode ran
+  first. Dust's 2-D clean forward shares this kernel to stay on the same scan
+  path as `Model.forward`; its batched perturbed scans keep the closed form.
 - **RNG streams.** NumPy `Generator` (PCG64) replaces the PyTorch RNG. Existing
   checkpoints load weights exactly, but freshly seeded runs do not reproduce
   PyTorch's random stream. Checkpoints record and restore the NumPy bit
@@ -158,9 +167,12 @@ under `tests/_reference/` as a development oracle for parity checks.
   `ctypes` cast objects. Quantized linear backward computes the FP32 STE weight
   gradient before the packed dX kernel so native worker spin does not compete
   with the following BLAS GEMM. These changes alter scheduling and copies only;
-  the per-output arithmetic and packed format are unchanged. On dense-tiny at
-  sequence 512 the packed dX kernel is 1.4-2.8x faster than the parent commit,
-  while the STE weight GEMM remains FP32 and sets the backward floor.
+  the per-output arithmetic and packed format are unchanged. The forward
+  batch block is 512 rows and input-gradient blocks are 64 rows only for 32x32
+  matrices, 32 rows otherwise; these are scheduling constants with
+  single-digit-or-smaller isolated effects. On dense-tiny at sequence 512 the
+  packed dX kernel is 1.4-2.8x faster than the parent commit, while the STE
+  weight GEMM remains FP32 and sets the backward floor.
 - **Batched packed-weight refresh.** Optimizer invalidation now records the
   changed ternary parameter references in `PackedCache.stale`. The next
   training forward packs all non-expert entries with one native
@@ -172,13 +184,21 @@ under `tests/_reference/` as a development oracle for parity checks.
   clears the stale set, and a failed batch raises. Dynamic MoE expert entries
   are excluded from prefetch and packed lazily. The packed format and
   per-matrix arithmetic are unchanged.
-- **In-place SiLU.** The full-precision SiLU path now applies the same
+- **Fused RMSNorm.** `Model._rmsnorm` uses one `npgrad.rmsnorm` node. Its
+  forward and backward repeat the old explicit graph's float32 operation
+  order, so output, input gradient, and gain gradient are bitwise identical;
+  it also keeps its result uncompressed like the former
+  `activation_storage("fp32")` region. The fused node removes the intermediate
+  square/mean/rsqrt/multiply tensors from the tape. On `512x32` forward plus
+  backward it measures about 0.39 ms versus 0.89 ms for the explicit graph.
+- **In-place SiLU and sigmoid.** The full-precision SiLU path applies the same
   negation, `exp`, add, and reciprocal ufuncs in place on the float64 copy,
-  then multiplies the original fp32 activation. Operand order and rounding are
-  unchanged, so full-precision outputs and gradients are bitwise identical;
-  a parity test covers fp32, bf16, and int8 activation storage. Reduced
-  storage uses a fresh float32 buffer and does not mutate the graph
-  activation. This removes several full-size temporaries at every FFN block.
+  then multiplies the original fp32 activation. Sigmoid similarly applies
+  `0.5*(1+tanh(0.5x))` in place. Operand order and rounding are unchanged, so
+  full-precision outputs and held gradients are bitwise identical; a SiLU
+  parity test covers fp32, bf16, and int8 activation storage. Reduced storage
+  uses fresh float32 buffers and does not mutate the graph activation. This
+  removes several full-size temporaries at every attention/FFN block.
 - **STE weight-gradient prototype not adopted.** A native AVX1 outer-product
   kernel for `x.T @ dy` was correct but slower than OpenBLAS on the training
   shape (for example 132 us native versus 74 us OpenBLAS at batch 512,
@@ -186,10 +206,12 @@ under `tests/_reference/` as a development oracle for parity checks.
   contiguous copies, and concatenated GEMMs lost as well. The shipped path
   remains the FP32 `x.T @ dy` BLAS call.
 - **SmaulOPT.** The factored optimizer keeps the original first moment and
-  row/column second-moment structure. The optional fused C++ update is reached
-  through NumPy buffers; without a compiler or for non-qualifying tensors the
-  NumPy reference update runs instead. Rounding can differ from the original
-  fused kernel.
+  row/column second-moment structure. All factored matrices are validated and
+  then updated by one batched C entry point that calls the same per-matrix
+  fused kernel sequentially; this removes FFI/Python overhead without changing
+  update order or arithmetic. Without a compiler or for non-qualifying tensors
+  the per-matrix or NumPy reference update runs instead. Rounding can differ
+  from the original fused kernel.
 - **Interpolation.** `F.interpolate(..., mode="linear", align_corners=False)`
   and `area` / `adaptive_avg_pool1d` are reimplemented and parity-tested; edge
   sampling follows PyTorch's half-pixel coordinates.
