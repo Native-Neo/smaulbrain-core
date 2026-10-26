@@ -6,9 +6,11 @@ from smaulbrain import config as cfg
 from smaulbrain import inference as inf
 from smaulbrain import model as model
 from smaulbrain import npgrad as ng
+from smaulbrain import ops
 from smaulbrain import quant
 from smaulbrain import safetensors_np
 from smaulbrain import smaulopt
+from smaulbrain import _native_opt as native_opt
 
 
 def test_npgrad_broadcast_and_dtype_cast():
@@ -37,6 +39,69 @@ def test_scan_matches_explicit_recurrence():
         state = alpha * state + values[:, t]
         rows.append(state.copy())
     np.testing.assert_allclose(got, np.stack(rows, axis=1), rtol=1e-5, atol=1e-6)
+
+
+def test_sigmoid_inplace_matches_allocating_reference():
+    rng = np.random.default_rng(20)
+    values = (rng.standard_normal((41, 29)) * 3.0).astype(np.float32)
+    x = ng.Tensor(values, requires_grad=True)
+    y = ng.sigmoid(x)
+    y.backward(np.ones_like(y.data))
+
+    x64 = values.astype(np.float64)
+    want = (0.5 * (1.0 + np.tanh(0.5 * x64))).astype(np.float32)
+    np.testing.assert_array_equal(y.data, want)
+    np.testing.assert_array_equal(x.grad, want * (1.0 - want))
+
+
+def test_fused_rmsnorm_matches_explicit_graph():
+    rng = np.random.default_rng(21)
+    gain_values = rng.standard_normal(32).astype(np.float32)
+    for shape in ((33, 32), (3, 33, 32)):
+        values = (rng.standard_normal(shape) * 2.0).astype(np.float32)
+        upstream = (rng.standard_normal(shape) * 0.5).astype(np.float32)
+
+        x_graph = ng.Tensor(values.copy(), requires_grad=True)
+        g_graph = ng.Tensor(gain_values.copy(), requires_grad=True)
+        y_graph = (x_graph * ng.rsqrt(
+            x_graph.square().mean(dim=-1, keepdim=True) + ops.EPS) * g_graph)
+        y_graph.backward(upstream)
+
+        x_fused = ng.Tensor(values.copy(), requires_grad=True)
+        g_fused = ng.Tensor(gain_values.copy(), requires_grad=True)
+        y_fused = ng.rmsnorm(x_fused, g_fused, ops.EPS)
+        y_fused.backward(upstream)
+
+        np.testing.assert_array_equal(y_fused.data, y_graph.data)
+        np.testing.assert_array_equal(x_fused.grad, x_graph.grad)
+        np.testing.assert_array_equal(g_fused.grad, g_graph.grad)
+
+
+def test_native_scan_fast_path_matches_closed_form(monkeypatch):
+    """The 2-D training fast path must agree with the chunked reference."""
+    if not quant.prepare_ternary_backend():
+        pytest.skip("native C++ ternary backend is unavailable")
+    rng = np.random.default_rng(19)
+    values = rng.standard_normal((257, 32)).astype(np.float32)
+    alpha = rng.uniform(0.2, 0.9, size=32).astype(np.float32)
+    upstream = rng.standard_normal(values.shape).astype(np.float32)
+
+    x_fast = ng.Tensor(values, requires_grad=True)
+    a_fast = ng.Tensor(alpha, requires_grad=True)
+    y_fast = ng.scan(x_fast, a_fast)
+    y_fast.backward(upstream)
+
+    native_lib = ng._native_scan._NATIVE_LIB
+    monkeypatch.setattr(ng._native_scan, "_NATIVE_LIB", None)
+    x_ref = ng.Tensor(values, requires_grad=True)
+    a_ref = ng.Tensor(alpha, requires_grad=True)
+    y_ref = ng.scan(x_ref, a_ref)
+    y_ref.backward(upstream)
+    monkeypatch.setattr(ng._native_scan, "_NATIVE_LIB", native_lib)
+
+    np.testing.assert_allclose(y_fast.data, y_ref.data, rtol=2e-6, atol=2e-6)
+    np.testing.assert_allclose(x_fast.grad, x_ref.grad, rtol=2e-6, atol=2e-6)
+    np.testing.assert_allclose(a_fast.grad, a_ref.grad, rtol=2e-5, atol=2e-5)
 
 
 @pytest.mark.parametrize("shape,batch", [
@@ -136,6 +201,33 @@ def test_safetensors_and_quant_roundtrip(tmp_path):
     np.testing.assert_allclose(y, x @ dense, rtol=1e-5, atol=1e-5)
     q, qscale = quant.fp8_e4m3_quantize(W)
     assert q.shape == W.shape and np.isfinite(qscale)
+
+
+def test_batched_native_optimizer_matches_single_matrix_path(monkeypatch):
+    rng = np.random.default_rng(23)
+    shapes = [(32, 32), (33, 64), (128, 32), (32,)]
+    base = {f"w{i}": rng.standard_normal(shape).astype(np.float32)
+            for i, shape in enumerate(shapes)}
+    grads = {name: rng.standard_normal(value.shape).astype(np.float32)
+             for name, value in base.items()}
+
+    def make():
+        params = {name: value.copy() for name, value in base.items()}
+        opt = smaulopt.SmaulOPT(lr=3e-4, weight_decay=0.01)
+        opt.register(params)
+        return opt, params
+
+    batch_opt, batch_params = make()
+    single_opt, single_params = make()
+    batch_norms = batch_opt.step(batch_params, grads, collect_norms=True)
+    monkeypatch.setattr(native_opt, "factored_step_many", lambda *a, **k: None)
+    single_norms = single_opt.step(single_params, grads, collect_norms=True)
+
+    for name in base:
+        np.testing.assert_array_equal(batch_params[name], single_params[name])
+        np.testing.assert_array_equal(batch_opt.state[name]["m"],
+                                      single_opt.state[name]["m"])
+        assert batch_norms[name] == single_norms[name]
 
 
 @pytest.mark.parametrize("preset", ["dense-tiny", "moe-tiny"])
