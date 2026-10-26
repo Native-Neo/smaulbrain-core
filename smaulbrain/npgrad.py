@@ -27,6 +27,7 @@ import weakref
 import numpy as np
 
 from . import precision as _precision
+from . import _quant_native as _native_scan
 
 DTYPE = np.float32
 _grad_enabled = True
@@ -611,9 +612,19 @@ def sigmoid(a):
     # Reduced storage already carries quantization error; using float32
     # transcendental math here is far cheaper and does not add a new source of
     # approximation.  The exact fp32 reference path keeps float64 math.
-    x = a.data.astype(np.float64) if full else a.data
-    out = 0.5 * (1.0 + np.tanh(0.5 * x))
-    out = out.astype(a.dtype)
+    if full:
+        x = a.data.astype(np.float64)
+        np.multiply(x, 0.5, out=x)
+        np.tanh(x, out=x)
+        np.add(x, 1.0, out=x)
+        np.multiply(x, 0.5, out=x)
+        out = x.astype(a.dtype)
+    else:
+        out = np.empty(a.shape, dtype=a.dtype)
+        np.multiply(a.data, 0.5, out=out)
+        np.tanh(out, out=out)
+        np.add(out, 1.0, out=out)
+        np.multiply(out, 0.5, out=out)
     held = out if full else None
     holder = []
 
@@ -671,17 +682,22 @@ def silu(a):
     # rounding as the allocating form, but avoids several full-size temporaries
     # in a layer that runs for every FFN block.
     if full:
-        x = a.data.astype(np.float64)
-        np.negative(x, out=x)
-        np.exp(x, out=x)
-        np.add(x, 1.0, out=x)
-        np.divide(1.0, x, out=x)
-        s = x
-        out = (a.data * s).astype(a.dtype)
+        s = np.negative(a.data, dtype=np.float64)
+        np.exp(s, out=s)
+        np.add(s, 1.0, out=s)
+        np.divide(1.0, s, out=s)
+        out = np.empty(a.shape, dtype=a.dtype)
+        np.multiply(a.data, s, out=out, dtype=np.float64)
         # The fp32 path already has the activation in the graph, so keeping its
         # derivative avoids recomputation.  Reduced storage drops it and
         # recomputes in backward instead of retaining another full-size cache.
-        held_grad = (s * (1.0 + a.data * (1.0 - s))).astype(a.dtype)
+        # Reuse one float64 scratch buffer for every derivative term; the
+        # operation order is unchanged, so the result is bitwise identical.
+        scratch = np.subtract(1.0, s)
+        np.multiply(scratch, a.data, out=scratch)
+        np.add(scratch, 1.0, out=scratch)
+        np.multiply(scratch, s, out=scratch)
+        held_grad = scratch.astype(a.dtype)
     else:
         # Do not mutate the graph's activation: negate into a fresh float32
         # buffer, then reuse it for exp and the sigmoid.
@@ -689,7 +705,8 @@ def silu(a):
         np.exp(s, out=s)
         np.add(s, 1.0, out=s)
         np.divide(1.0, s, out=s)
-        out = (a.data * s).astype(a.dtype)
+        out = np.empty(a.shape, dtype=a.dtype)
+        np.multiply(a.data, s, out=out)
         held_grad = None
 
     def bw(g):
@@ -827,6 +844,37 @@ def mean(a, axis=None, keepdims=False):
         return (_unbroadcast(np.broadcast_to(gg, a.shape).copy(), a.shape),)
 
     return make_op(np.mean(a.data, axis=axis, keepdims=keepdims), (a,), bw, cache=False)
+
+
+def rmsnorm(a, gain, eps=1e-6):
+    """Fused RMSNorm over the last axis.
+
+    The forward and backward arithmetic deliberately repeats the operation
+    order of the equivalent ``a.square().mean(-1).add(eps).rsqrt()`` graph.
+    Tests assert bitwise-identical outputs and gradients, while the fused node
+    removes the intermediate autograd tensors from the hot path.
+    """
+    a, gain = _t(a), _t(gain)
+    x = a.data
+    gdata = gain.data
+    squared = x * x
+    ms = np.mean(squared, axis=-1, keepdims=True)
+    denom = ms + np.asarray(eps, dtype=DTYPE)
+    inv = np.reciprocal(np.sqrt(denom))
+    xn = x * inv
+    out = xn * gdata
+
+    def bw(g):
+        gxn = _unbroadcast(g * gdata, x.shape)
+        gx = _unbroadcast(gxn * inv, x.shape)
+        ginv = _unbroadcast(gxn * x, inv.shape)
+        gdenom = -0.5 * ginv * inv * inv * inv
+        gsquared = np.broadcast_to(gdenom / x.shape[-1], x.shape).copy()
+        gx = gx + 2.0 * gsquared * x
+        ggain = _unbroadcast(g * xn, gdata.shape)
+        return gx, ggain
+
+    return make_op(out, (a, gain), bw, cache=False)
 
 
 def matmul(a, b):
@@ -1114,8 +1162,45 @@ def scan(values, alpha, s0=None):
     """
     values, alpha = _t(values), _t(alpha)
     one_dim = values.ndim == 2
-    v = values.data[None, :, :] if one_dim else values.data
-    a = alpha.data.astype(DTYPE)
+    value_data = values.data
+    alpha_data = alpha.data
+
+    # The native scan is a sequential recurrence.  It is substantially faster
+    # than the chunked closed form for the small per-layer widths used here,
+    # and it is already covered by the finite-difference parity tests.  Keep
+    # the closed form for batched/leading dimensions and for an explicit
+    # initial state, whose ds0 term the native kernel does not return.
+    native_suitable = (s0 is None and one_dim
+                       and value_data.dtype == DTYPE and alpha_data.dtype == DTYPE
+                       and value_data.flags.c_contiguous
+                       and alpha_data.flags.c_contiguous
+                       and alpha_data.ndim == 1
+                       and alpha_data.shape[0] == value_data.shape[1])
+    if native_suitable:
+        # Loading is idempotent and cached for the process.  Doing it here (as
+        # well as in the quantized model setup) keeps scan performance
+        # independent of which model mode happened to run first.
+        if _native_scan._NATIVE_LIB is None:
+            _native_scan.prepare_ternary_backend()
+        if _native_scan._NATIVE_LIB is not None:
+            states = np.empty_like(value_data, dtype=DTYPE)
+            state = np.zeros(value_data.shape[1], dtype=DTYPE)
+            if not _native_scan.recurrent_scan(value_data, alpha_data, state, states):
+                raise RuntimeError("native recurrent scan rejected valid contiguous inputs")
+
+            def native_bw(g):
+                upstream = np.ascontiguousarray(g, dtype=DTYPE)
+                dvalues = np.empty_like(states, dtype=DTYPE)
+                dalpha = np.empty(alpha_data.shape[0], dtype=np.float64)
+                if not _native_scan.recurrent_backward_scan(
+                        upstream, states, alpha_data, dvalues, dalpha):
+                    raise RuntimeError("native recurrent backward scan rejected valid inputs")
+                return dvalues, dalpha.astype(alpha.dtype)
+
+            return make_op(states, (values, alpha), native_bw, cache=False)
+
+    v = value_data[None, :, :] if one_dim else value_data
+    a = alpha_data.astype(DTYPE)
     chunk = _scan_chunk_size(a)
     initial = None if s0 is None else (_t(s0).data[None, :] if one_dim else _t(s0).data)
     if initial is None:
