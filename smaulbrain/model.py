@@ -77,6 +77,10 @@ class PackedCache:
     def __init__(self, max_entries=256):
         self.max_entries = max_entries
         self.d = {}
+        # Invalidated weights stay here until the next training forward can
+        # repack all of them in one native call. They are not usable as cache
+        # hits: get() still packs lazily, and a full invalidate() drops them.
+        self.stale = {}
         self.reuse_hits = 0
         self.builds = 0
 
@@ -86,18 +90,52 @@ class PackedCache:
             self.reuse_hits += 1
             return entry["packed"], entry["scale"], entry["shape"]
         packed, scale, shape, _ = _quant.pack_ternary_tiled(W.data)
+        self.stale.pop(key, None)
         if key not in self.d and self.max_entries > 0 and len(self.d) >= self.max_entries:
             self.d.pop(next(iter(self.d)))
         self.d[key] = {"packed": packed, "scale": scale, "shape": shape, "ref": W}
         self.builds += 1
         return packed, scale, shape
 
+    def prefetch(self, exclude_prefixes=()):
+        """Repack invalidated weights in one native batch call.
+
+        This is only an optimization: entries remain invalid until replaced,
+        and get() falls back to per-matrix lazy packing if prefetch is not
+        called. Excluded keys are dropped and will be repacked on demand.
+        """
+        if not self.stale:
+            return
+        pending = []
+        for key in list(self.stale):
+            entry = self.stale.pop(key)
+            if key in self.d:
+                continue
+            if any(key.startswith(prefix) for prefix in exclude_prefixes):
+                continue
+            pending.append((key, entry))
+        if not pending:
+            return
+        weights = [entry["ref"].data for _, entry in pending]
+        packed_entries = _quant.pack_ternary_tiled_many(weights)
+        if len(packed_entries) != len(pending):
+            raise RuntimeError("batch ternary packing returned the wrong count")
+        for (key, entry), (packed, scale, shape, _th) in zip(pending, packed_entries):
+            if self.max_entries > 0 and len(self.d) >= self.max_entries:
+                self.d.pop(next(iter(self.d)))
+            self.d[key] = {"packed": packed, "scale": scale,
+                           "shape": shape, "ref": entry["ref"]}
+            self.builds += 1
+
     def invalidate(self, keys=None):
         if keys is None:
             self.d.clear()
+            self.stale.clear()
         else:
             for key in keys:
-                self.d.pop(key, None)
+                entry = self.d.pop(key, None)
+                if entry is not None:
+                    self.stale[key] = {"ref": entry["ref"]}
 
 
 class FP8Cache:
@@ -506,6 +544,9 @@ class Model:
         started = time.perf_counter()
         activation_stats = None
         forward_seconds = backward_seconds = None
+        if self.forward_quant == "ternary":
+            exclude = ("expert.",) if self.spec.kind == "moe" else ()
+            self.packed.prefetch(exclude_prefixes=exclude)
         with ng.enable_grad(), _precision.activation_storage(self.activation_storage), \
                 _precision.gradient_storage(self.gradient_storage):
             logits, _, det = self._forward_impl(tok[:-1], return_hidden=True)
