@@ -576,10 +576,9 @@ class Model:
                     target.grad = _precision.store_gradient(
                         _precision.gradient_array(target.grad) + merged,
                         self.gradient_storage)
-        if self.gradient_storage == "bf16":
-            grads = {k: v.grad for k, v in p.items() if v.grad is not None}
-        else:
-            grads = {k: v.grad.copy() for k, v in p.items() if v.grad is not None}
+        # Keep the completed buffers alive through the returned dict; clearing
+        # Parameter.grad below only drops references and does not mutate them.
+        grads = {k: v.grad for k, v in p.items() if v.grad is not None}
         out = float(loss.detach().item())
         aux = dict(self._last_aux)
         aux["loss_main"] = float(loss_main.detach().item())
