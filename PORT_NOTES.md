@@ -181,9 +181,9 @@ under `tests/_reference/` as a development oracle for parity checks.
   activation. This removes several full-size temporaries at every FFN block.
 - **STE weight-gradient prototype not adopted.** A native AVX1 outer-product
   kernel for `x.T @ dy` was correct but slower than OpenBLAS on the training
-  shape (for example 133 us versus 235 us at batch 512, 32x128), and only
-  reached parity for one 128x32 batch-64 case. Operand transposes,
-  contiguous copies, and concatenated GEMMs also lost. The shipped path
+  shape (for example 132 us native versus 74 us OpenBLAS at batch 512,
+  32x128). It was also slower on every shape at batch 64. Operand transposes,
+  contiguous copies, and concatenated GEMMs lost as well. The shipped path
   remains the FP32 `x.T @ dy` BLAS call.
 - **SmaulOPT.** The factored optimizer keeps the original first moment and
   row/column second-moment structure. The optional fused C++ update is reached
