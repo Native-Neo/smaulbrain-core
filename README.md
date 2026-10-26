@@ -160,6 +160,21 @@ package compiles a small C++ kernel on first use (cached); without a compiler
 it transparently falls back to a NumPy decode-and-multiply path. FP8 is
 software-emulated on CPU.
 
+Packed ternary is faster for complete training steps on the dense workload.
+On `dense-tiny` at sequence 512, with optimizer updates and re-packing included,
+the measured step was 146.1 ms versus 197.6 ms for FP32 (1.35x); forward was
+70.8 ms versus 127.8 ms (1.81x). Backward was 65.6 ms versus 60.9 ms because
+the straight-through weight gradient remains an FP32 GEMM even though the
+input gradient comes from packed weights. At sequence 64 the step is about
+1.12x faster. See
+[`benchmarks/TERNARY_RESULTS.md`](benchmarks/TERNARY_RESULTS.md) for the frozen
+pure-compute comparison, kernel A/B numbers, and reproduction commands:
+
+```bash
+python benchmarks/ternary_benchmark.py --steps 15 --warmup 3 --runs 3 \
+    --seq-lens 64 512 --modes fp32 ternary
+```
+
 The NCM runtime can also use native sparse direct-ternary update helpers. They
 sample update coordinates from a strided gradient view without building Python
 magnitude/probability/mask tensors, then apply queued updates to packed trits in
