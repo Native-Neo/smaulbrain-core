@@ -26,6 +26,9 @@ quantization, and a factored optimizer, in pure NumPy (CPU-only, float32).
   predict several tokens ahead with the shared embedding/head, plus
   **speculative decoding** that drafts with MTP and verifies in one batched
   forward (greedy output is token-identical to plain decoding).
+- **Experimental Dust trainer**: opt-in activation-perturbation training
+  without autograd for dense FP32 models. Backpropagation remains the default;
+  see [Experimental: Dust activation-perturbation training](#experimental-dust-activation-perturbation-training).
 
 ## Presets
 
@@ -163,6 +166,181 @@ magnitude/probability/mask tensors, then apply queued updates to packed trits in
 C++ without concatenating the per-backward update lists. These helpers are
 optional APIs; callers can detect their availability and retain a portable
 fallback.
+
+## Reduced-precision activation and gradient storage
+
+Training keeps every differentiable intermediate alive until backward. At long
+sequence lengths those cached activations, not the parameters, dominate RAM.
+Two opt-in flags compress that cache and completed parameter gradients; the
+default remains the original all-float32 path. They are accepted by
+`cli.add_common_args()` alongside the other training options:
+
+```text
+--activation-storage {fp32,bf16,int8}   # cached activations
+--gradient-storage {fp32,bf16}          # completed parameter gradients
+```
+
+For example, with the `argparse` setup from the quick start:
+
+```python
+args = ap.parse_args([
+    "--preset", "dense-tiny", "--seq-len", "512",
+    "--activation-storage", "bf16",
+    "--gradient-storage", "bf16",
+    "--checkpoint", "checkpoints/run",
+])
+```
+
+| format | cached activation storage | notes |
+|--------|---------------------------|-------|
+| `fp32` | 4 bytes/value | default, bit-for-bit original path |
+| `bf16` | 2 bytes/value | raw IEEE bfloat16 bits in `uint16`, round-to-nearest-even; no `ml_dtypes` dependency |
+| `int8` | 1 byte/value + one scale | dynamic symmetric per-tensor scale; computed-scale codes stay in `[-127, 127]`, while caller-supplied scales are clipped |
+
+Implementation details and limits:
+
+- BF16 is stored as its actual 16-bit bit pattern, not as a float32 array that
+  was briefly cast. Decoding widens with a shift; `NaN`, `±Inf`, and signed zero
+  are preserved. Float32 subnormals follow IEEE bfloat16 rounding, so values
+  below the bfloat16 subnormal range round to zero. `Tensor.data` dequantizes
+  on access, so the logical dtype remains float32.
+- INT8 rejects non-finite tensors instead of silently saturating. All-zero
+  tensors use a unit scale. When the scale is computed from the tensor, the
+  encoder skips a redundant clipping pass because the rounded codes are
+  already in range; an explicit scale is clipped to the signed range.
+- Reduced activation modes use float32 transcendental math for SiLU, GELU,
+  sigmoid, and softplus. The FP32 reference path keeps float64 math. This is
+  below the storage-quantization error already present in BF16/INT8 and avoids
+  unnecessary conversion and recomputation work.
+- `--gradient-storage bf16` compresses each parameter's completed gradient
+  buffer after float32 accumulation. Optimizer state remains float32, and
+  clipping/updates decode one parameter at a time.
+- Precision-critical values stay float32 even when compression is enabled:
+  RMSNorm statistics, router scores/expert selection, recurrent scan state
+  history, softmax/cross-entropy and MSE losses, final logits, optimizer state,
+  and master parameters. Model architecture, checkpoint format, and loss
+  definitions are unchanged.
+- Compression is primarily a memory optimization. With the optimized codecs,
+  dense-tiny at sequence 512 measured 12-16% lower CPU step time for BF16/INT8
+  than FP32, while at sequence 64 the modes are within measurement noise. The
+  relative conversion cost depends on tensor shapes, sequence length, and
+  preset; benchmark the target configuration before choosing a mode.
+- Storage choices are runtime options, not checkpoint architecture. They are
+  recorded in the manifest for reproducibility, and old checkpoints load with
+  any setting.
+
+`benchmarks/precision_benchmark.py` runs identical seeds, data, clipping, and
+optimizer settings across configurations and reports peak RSS, activation-cache
+bytes, gradient bytes, and per-phase timings:
+
+```bash
+python benchmarks/precision_benchmark.py --preset dense-tiny --seq-len 512 \
+    --steps 60 --lr 1e-3 --activation-storage bf16 --gradient-storage bf16
+```
+
+Measured memory/throughput/quality tables, codec validation, and reproduction
+commands are in [`benchmarks/PRECISION_RESULTS.md`](benchmarks/PRECISION_RESULTS.md).
+
+## Experimental: Dust activation-perturbation training
+
+`--trainer dust` selects an isolated alternative to backpropagation based on
+the Dust activation-perturbation estimator
+([paper](https://qlabs.sh/research/dust),
+[official code](https://github.com/qlabs-eng/dust)). It is **experimental and
+not the default**. The quality measurements in this repository are CPU-scale
+checks on `dense-tiny`, sequence length 64, 2-4 draws, and 40-60 steps; memory
+points up to sequence length 512 are reported separately. This is not a
+reproduction of the paper's pretraining runs, which use much larger corpora
+and populations.
+
+What is implemented:
+
+- Gaussian perturbations of cached linear-layer outputs, per-token centered
+  loss rewards, future-token credit for keys/values, and direct loss credit for
+  writer/hub/embedding sites. Attention internals are credited through the
+  estimated attention-output error, as in the paper.
+- An independent NumPy forward (`smaulbrain/dust.py`) that never calls the
+  autograd tape or `Model.loss_and_backward`. Clean-forward and from-block
+  rerun parity are covered by tests.
+- SGD with momentum, configurable draws/sigmas/gamma/seed, deterministic
+  per-step perturbation RNG, and exact checkpoint resume. The checkpoint
+  manifest records `algorithm: dust` and the full Dust configuration, and
+  loading a Dust checkpoint in backprop mode (or vice versa) is rejected.
+- A batched performance path: perturbed nonlinearities use float32, independent
+  direct groups share one forward, and the head uses adaptive float32 slabs.
+  On multi-CPU machines the head runs in a deterministic background thread
+  while the block loop runs; the cloned RNG stream preserves serial results.
+  Tests require bitwise equality between batched/parallel and separate/serial
+  paths. The clean forward still uses the exact reference arithmetic.
+- Ctrl+C during a Dust step is deferred until the update commits; the trainer
+  then saves a resumable checkpoint.
+
+Limits:
+
+- **Dense FP32 only.** MoE, MTP depth greater than zero, FP8/ternary
+  forward/backward modes, and activation or gradient storage other than
+  `fp32` are rejected with an explicit error. These combinations were not
+  implemented because the verified estimator does not define them for this
+  architecture, or because their forward arithmetic would change the
+  perturbation semantics.
+- Non-matrix parameters (RMSNorm gains, `attn.w`, `attn.u`) are **frozen by
+  default**. `--dust-scalar-draws K` enables an experimental two-sided
+  weight-space ES fallback over all of them. That is broader than the paper's
+  two residual scalars per layer and was not beneficial in the CPU tests.
+- Dust still stores one clean activation cache, a gradient dict for the trained
+  matrix parameters, and SGD momentum state. It removes the autograd graph and
+  activation gradients; it is not a constant-memory trainer. Clean-cache bytes
+  are smaller than backprop's activation cache, but in the matched CPU memory
+  points peak RSS did not improve, and at sequence 512 Dust still peaked
+  higher than backprop because its concurrent head pass, draw scratch, and
+  allocator retention dominated (118.6 versus 103.8 MiB). The memory argument
+  depends on a fused or memory-reusing estimator.
+- The speed work made the earlier serial NumPy implementation about 3.1x
+  faster (sequence 64: 1.21 s to 0.39 s per training step; sequence 512:
+  10.05 s to 3.35 s). It is still slower than tuned FP32 backprop: about 6-7x
+  at K=2 and 10.5x at K=4 in the 40-step dense-tiny comparison, and about 6x
+  and 9.2x in the single-seed 60-step run. The step-time ratio grows with
+  sequence length (about 12x at 512 in the memory points). The paper's
+  population is 256 to 16,384 draws; the default draw counts here are
+  deliberately small.
+
+Example, using the `argparse` setup from the quick start:
+
+```python
+args = ap.parse_args([
+    "--preset", "dense-tiny", "--trainer", "dust",
+    "--seq-len", "64", "--mtp-depth", "0",
+    "--checkpoint", "checkpoints/dust",
+    "--dust-writer-draws", "2", "--dust-hidden-draws", "2",
+    "--dust-hub-draws", "2", "--dust-embed-draws", "2",
+    "--dust-local-draws", "2", "--dust-head-draws", "1024",
+    "--dust-gamma", "0.5", "--dust-lr", "0.05",
+    "--dust-momentum", "0.9", "--dust-seed", "1234",
+])
+```
+
+`--dust-sigma`, `--dust-hub-sigma`, `--dust-hub-sigma-deep`,
+`--dust-local-sigma`, and `--dust-head-sigma` control the perturbation
+scales. The defaults are 0.05, tuned down from the paper's 0.2/0.4 because
+SmaulBRAIN's activation scale makes the larger perturbations biased. The
+default credit decay is 0.5, chosen to match the recurrence decay; the paper's
+0.98 is available explicitly. `--dust-grad-clip` defaults to 0 (no clipping).
+`--grad-clip` is backprop's clipping flag; passing a non-default value in Dust
+mode while `--dust-grad-clip` is left at 0 is rejected with a pointer to
+`--dust-grad-clip` rather than being silently ignored.
+
+`benchmarks/dust_benchmark.py` runs matched backprop and Dust configurations
+in fresh subprocesses and reports held-out loss, training time, peak RSS,
+activation-cache bytes, gradient bytes, optimizer bytes, and estimator
+scratch bytes:
+
+```bash
+python benchmarks/dust_benchmark.py --steps 40 --seeds 0 1 2 \
+    --dust-configs k2:0.05 k2:0.02 k4:0.05 --precision-reference
+```
+
+The measured tables, tuning ablations, and limitations are in
+[`benchmarks/DUST_RESULTS.md`](benchmarks/DUST_RESULTS.md).
 
 ## Native kernels
 
