@@ -161,6 +161,30 @@ under `tests/_reference/` as a development oracle for parity checks.
   the per-output arithmetic and packed format are unchanged. On dense-tiny at
   sequence 512 the packed dX kernel is 1.4-2.8x faster than the parent commit,
   while the STE weight GEMM remains FP32 and sets the backward floor.
+- **Batched packed-weight refresh.** Optimizer invalidation now records the
+  changed ternary parameter references in `PackedCache.stale`. The next
+  training forward packs all non-expert entries with one native
+  `pack_ternary_tiled_many` call into a single uint8 allocation and returns
+  views, avoiding 105 ctypes calls and a redundant per-matrix copy on
+  dense-tiny. The single-matrix packing entry point likewise returns its
+  freshly allocated buffer without a redundant copy. Stale entries are never
+  cache hits: `get()` rebuilds on a reference mismatch, full invalidation
+  clears the stale set, and a failed batch raises. Dynamic MoE expert entries
+  are excluded from prefetch and packed lazily. The packed format and
+  per-matrix arithmetic are unchanged.
+- **In-place SiLU.** The full-precision SiLU path now applies the same
+  negation, `exp`, add, and reciprocal ufuncs in place on the float64 copy,
+  then multiplies the original fp32 activation. Operand order and rounding are
+  unchanged, so full-precision outputs and gradients are bitwise identical;
+  a parity test covers fp32, bf16, and int8 activation storage. Reduced
+  storage uses a fresh float32 buffer and does not mutate the graph
+  activation. This removes several full-size temporaries at every FFN block.
+- **STE weight-gradient prototype not adopted.** A native AVX1 outer-product
+  kernel for `x.T @ dy` was correct but slower than OpenBLAS on the training
+  shape (for example 133 us versus 235 us at batch 512, 32x128), and only
+  reached parity for one 128x32 batch-64 case. Operand transposes,
+  contiguous copies, and concatenated GEMMs also lost. The shipped path
+  remains the FP32 `x.T @ dy` BLAS call.
 - **SmaulOPT.** The factored optimizer keeps the original first moment and
   row/column second-moment structure. The optional fused C++ update is reached
   through NumPy buffers; without a compiler or for non-qualifying tensors the
