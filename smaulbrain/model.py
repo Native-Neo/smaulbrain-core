@@ -154,13 +154,16 @@ def _quantized_linear(X, W, Wq, kind, backward_mode, packed, scale, shape):
                 Xq, _ = _quant.fp8_e4m3_quantize(X.data)
                 return dYq @ Wq.T, _weight_grad(Xq, dYq)
             return g @ Wq.T, _weight_grad(X, g)
-        dX = _quant.packed_matmat_transpose(g, packed, shape, scale)
         if backward_mode == "fp8":
             dYq, _ = _quant.fp8_e4m3_quantize(g)
             Xq, _ = _quant.fp8_e4m3_quantize(X.data)
             dW = _weight_grad(Xq, dYq)
         else:
             dW = _weight_grad(X, g)
+        # The packed input-gradient kernel uses the native worker pool. Run
+        # the BLAS weight-gradient first so the workers' post-job spin cannot
+        # compete with OpenBLAS on the same cores.
+        dX = _quant.packed_matmat_transpose(g, packed, shape, scale)
         return dX, dW
 
     return ng.make_op(out, (X, W), bw)
