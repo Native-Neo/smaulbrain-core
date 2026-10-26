@@ -121,6 +121,47 @@ def pack_ternary_tiled(W: np.ndarray):
     return packed, scale, shape, th
 
 
+def pack_ternary_tiled_many(weights):
+    """Pack several 2-D matrices with one native call when possible.
+
+    Returns one ``(packed, scale, shape, threshold)`` tuple per input. The
+    packed buffers are views into one freshly allocated array, so no copies
+    are made and the individual byte sequences match :func:`pack_ternary_tiled`.
+    Unsupported inputs fall back to the per-matrix path.
+    """
+    arrays = [np.asarray(w) for w in weights]
+    if not arrays:
+        return []
+    suitable = (prepare_ternary_backend()
+                and all(a.dtype == np.float32 and a.ndim == 2
+                        and a.flags.c_contiguous and a.size > 0 for a in arrays))
+    if not suitable:
+        return [pack_ternary_tiled(a) for a in arrays]
+    count = len(arrays)
+    dins = np.fromiter((a.shape[0] for a in arrays), dtype=np.uintp, count=count)
+    douts = np.fromiter((a.shape[1] for a in arrays), dtype=np.uintp, count=count)
+    sizes = (((douts + 15) // 16) * dins * 4).astype(np.uintp, copy=False)
+    total = int(sizes.sum())
+    out = np.empty(total, dtype=np.uint8)
+    scales = np.empty(count, dtype=np.float32)
+    thresholds = np.empty(count, dtype=np.float32)
+    ptrs = np.fromiter((a.ctypes.data for a in arrays), dtype=np.uintp, count=count)
+    status = _NATIVE_LIB.smaulbrain_pack_ternary_tiled_many(
+        ptrs.ctypes.data, out.ctypes.data, sizes.ctypes.data,
+        dins.ctypes.data, douts.ctypes.data,
+        scales.ctypes.data, thresholds.ctypes.data, count)
+    if status != 0:
+        raise RuntimeError(f"native batch ternary packing failed (status {status})")
+    results = []
+    offset = 0
+    for i in range(count):
+        end = offset + int(sizes[i])
+        results.append((TiledPacked(out[offset:end]), np.float32(scales[i]),
+                        (int(dins[i]), int(douts[i])), np.float32(thresholds[i])))
+        offset = end
+    return results
+
+
 def retile_ternary(packed, shape):
     """Convert canonical row-major 2-bit codes to the tile-contiguous layout.
 
@@ -307,6 +348,11 @@ def prepare_ternary_backend() -> bool:
             ctypes.c_void_p, ctypes.c_void_p, ctypes.c_size_t, ctypes.c_size_t,
             ctypes.POINTER(ctypes.c_float), ctypes.POINTER(ctypes.c_float)]
         lib.smaulbrain_pack_ternary_tiled.restype = ctypes.c_int
+        lib.smaulbrain_pack_ternary_tiled_many.argtypes = [
+            ctypes.c_void_p, ctypes.c_void_p, ctypes.c_void_p,
+            ctypes.c_void_p, ctypes.c_void_p, ctypes.c_void_p,
+            ctypes.c_void_p, ctypes.c_size_t]
+        lib.smaulbrain_pack_ternary_tiled_many.restype = ctypes.c_int
         lib.smaulbrain_pack_ternary.argtypes = [
             ctypes.c_void_p, ctypes.c_void_p, ctypes.c_size_t,
             ctypes.POINTER(ctypes.c_float), ctypes.POINTER(ctypes.c_float)]
