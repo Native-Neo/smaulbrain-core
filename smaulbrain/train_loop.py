@@ -7,8 +7,10 @@ After each successful optimizer update, in order:
     candidate in isolation; 8. validate; 9. publish committed checkpoint;
   10. adopt candidate; 11. next update.
 """
+import contextlib
 import os
 import shutil
+import signal
 import time
 import math
 import tempfile
@@ -29,6 +31,49 @@ def _expert_dict(params: dict, eid: int) -> dict:
     return {"Win": params[f"expert.{eid}.Win"], "Wout": params[f"expert.{eid}.Wout"]}
 
 
+@contextlib.contextmanager
+def _atomic_step(active: bool):
+    """Delay SIGINT until a multi-second Dust step has committed.
+
+    A temporary Python handler is used instead of only masking the main
+    thread: a process-directed SIGINT may be delivered to a BLAS/OpenMP
+    worker, and masking just the main thread does not stop the main thread
+    from observing Python's pending-signal flag.  The handler records the
+    signal and the step runs to its commit point; on exit the handler is
+    restored and KeyboardInterrupt is raised, so the trainer saves at a
+    committed boundary.
+
+    In a non-main thread, where installing a handler is not allowed, fall
+    back to the calling thread's signal mask when available.
+    """
+    if not active:
+        yield
+        return
+    pending = []
+
+    def defer(signum, frame):
+        pending.append(signum)
+
+    try:
+        old = signal.signal(signal.SIGINT, defer)
+    except (ValueError, OSError):
+        if not hasattr(signal, "pthread_sigmask"):
+            yield
+            return
+        old_mask = signal.pthread_sigmask(signal.SIG_BLOCK, {signal.SIGINT})
+        try:
+            yield
+        finally:
+            signal.pthread_sigmask(signal.SIG_SETMASK, old_mask)
+        return
+    try:
+        yield
+    finally:
+        signal.signal(signal.SIGINT, old)
+    if pending:
+        raise KeyboardInterrupt
+
+
 class Trainer:
     def __init__(self, spec, args, stream, eval_stream=None):
         self.spec = spec
@@ -44,11 +89,27 @@ class Trainer:
                                   paging_store=None, capacity_factor=args.expert_capacity_factor,
                                   device=getattr(args, "device", "cpu"),
                                   mtp_depth=getattr(args, "mtp_depth", 0),
-                                  mtp_loss_weight=getattr(args, "mtp_loss_weight", 0.1))
+                                  mtp_loss_weight=getattr(args, "mtp_loss_weight", 0.1),
+                                  activation_storage=getattr(args, "activation_storage", "fp32"),
+                                  gradient_storage=getattr(args, "gradient_storage", "fp32"))
         if spec.kind == "moe":
             self.model.store = self._make_store(args.paging, n_exp, self.model.p, None)
-        self.opt = _opt.SmaulOPT(lr=args.lr, beta1=args.beta1, beta2=args.beta2,
-                                 eps=args.eps, weight_decay=args.weight_decay)
+        self.algorithm = getattr(args, "trainer", "backprop")
+        if self.algorithm == "dust":
+            from . import dust as _dust
+            self.dust_config = _dust.config_from_args(args)
+            _dust.check_supported(self.model, self.dust_config)
+            self.dust = _dust.DustEngine(self.model, self.dust_config)
+            self.opt = _dust.DustSGD(
+                lr=self.dust_config.lr, momentum=self.dust_config.momentum,
+                weight_decay=args.weight_decay)
+        elif self.algorithm == "backprop":
+            self.dust = None
+            self.dust_config = None
+            self.opt = _opt.SmaulOPT(lr=args.lr, beta1=args.beta1, beta2=args.beta2,
+                                     eps=args.eps, weight_decay=args.weight_decay)
+        else:
+            raise ValueError(f"unknown trainer {self.algorithm!r}")
         self.opt.register(self.model.p)
         self.sched = _growth.GrowthScheduler(
             every_steps=args.growth_every_steps, loss_nats=args.growth_loss_nats,
@@ -89,6 +150,9 @@ class Trainer:
         arch = _cfg.arch_report(self.spec, n_exp, mtp_depth=self.model.mtp_depth)
         extra = {"forward_quant": self.model.forward_quant,
                  "backward_mode": self.model.backward_mode,
+                 "activation_storage": self.model.activation_storage,
+                 "gradient_storage": self.model.gradient_storage,
+                 "algorithm": self.algorithm,
                  "paging": self.args.paging, "seed": self.args.seed,
                  "lr": self.args.lr, "seq_len": self.args.seq_len,
                  "capacity_factor": self.model.capacity_factor,
@@ -100,14 +164,25 @@ class Trainer:
                                  "sha256": self.stream.sha256},
                  "eval_cursor": (self.eval_stream.cursor
                                  if self.eval_stream is not None else None)}
-        factored = {k: bool(state["factored"]) for k, state in self.opt.state.items()}
+        if self.dust is not None:
+            extra["dust"] = self.dust.config_dict()
+        if self.algorithm == "dust":
+            opt_meta = {"class": "DustSGD", "lr": self.opt.lr,
+                        "momentum": self.opt.momentum,
+                        "weight_decay": self.opt.weight_decay,
+                        "algorithm": "dust"}
+        else:
+            factored = {k: bool(state["factored"])
+                        for k, state in self.opt.state.items()}
+            opt_meta = {"class": "SmaulOPT", "lr": self.opt.lr,
+                        "beta1": self.opt.beta1, "beta2": self.opt.beta2,
+                        "eps": self.opt.eps,
+                        "weight_decay": self.opt.weight_decay,
+                        "factored": factored}
         return _ckpt.build_manifest(
             self.spec.name, arch, extra, self.sched.to_record(),
             self.stream.cursor, {"numpy_state": self.rng.bit_generator.state},
-            n_exp, list(range(n_exp)),
-            {"class": "SmaulOPT", "lr": self.opt.lr, "beta1": self.opt.beta1,
-             "beta2": self.opt.beta2, "eps": self.opt.eps,
-             "weight_decay": self.opt.weight_decay, "factored": factored})
+            n_exp, list(range(n_exp)), opt_meta)
 
     def _opt_state_payload(self):
         # Serialization is synchronous, so live tensors can be referenced
@@ -129,6 +204,11 @@ class Trainer:
         if man["preset"] != self.spec.name:
             raise ValueError(f"checkpoint preset {man['preset']} != {self.spec.name}")
         ck_cfg = man.get("config", {}) or {}
+        ck_algorithm = ck_cfg.get("algorithm", "backprop")
+        if ck_algorithm != self.algorithm:
+            raise ValueError(
+                f"checkpoint was trained with {ck_algorithm!r}, but this trainer "
+                f"is configured for {self.algorithm!r}")
         ck_mtp = int(ck_cfg.get("mtp_depth", 0))
         if ck_mtp != self.model.mtp_depth:
             # The checkpoint owns the architecture: old (pre-MTP) checkpoints
@@ -146,6 +226,20 @@ class Trainer:
         flags = man.get("optimizer", {}).get("factored", {})
         self.opt.load_state_dict(blob.pop("opt_state"), flags, copy=False)
         self.opt.register(self.model.p)
+        if self.algorithm == "dust":
+            from . import dust as _dust
+            if "dust" not in ck_cfg:
+                raise ValueError("Dust checkpoint is missing its dust config")
+            self.dust_config = _dust.DustConfig.from_dict(ck_cfg["dust"])
+            _dust.check_supported(self.model, self.dust_config)
+            self.dust = _dust.DustEngine(self.model, self.dust_config)
+            # Dust checkpoints own the optimizer hyperparameters too.  Restoring
+            # them keeps a resumed run bit-exact even if the launching command
+            # line used different --dust-lr/--dust-momentum/--weight-decay
+            # values; the manifest's optimizer and dust blocks stay consistent.
+            self.opt.lr = float(self.dust_config.lr)
+            self.opt.momentum = float(self.dust_config.momentum)
+            self.opt.weight_decay = float(self.dust_config.weight_decay)
         self.sched = _growth.GrowthScheduler.from_record(
             man["scheduler"], min_eval_samples=self.args.growth_min_eval_samples)
         rng_state = man.get("rng_state", {})
@@ -246,7 +340,9 @@ class Trainer:
                              paging_mode="R", paging_store=None,
                              capacity_factor=self.model.capacity_factor,
                              mtp_depth=self.model.mtp_depth,
-                             mtp_loss_weight=self.model.mtp_loss_weight)
+                             mtp_loss_weight=self.model.mtp_loss_weight,
+                             activation_storage=self.model.activation_storage,
+                             gradient_storage=self.model.gradient_storage)
         toks = self._eval_batches(n_batches=1)[0]
         logits, _ = probe.forward(toks, train=False)
         logits = logits.data if isinstance(logits, Tensor) else np.asarray(logits)
@@ -313,78 +409,102 @@ class Trainer:
     def train(self, max_steps=None, log_every=10, eval_every=0, ckpt_every=0,
               grad_clip=1.0, fail_at=None, growth_fail_at=None):
         steps = 0
-        while True:
-            if max_steps is not None and self.sched.global_step >= max_steps:
-                break
-            # A pending event must be resolved BEFORE any further optimizer update.
-            if self.sched.pending is not None:
-                self._resolve_pending(fail_at=growth_fail_at)
-                continue
-            toks = self.stream.next_tokens(self.args.seq_len)
-            loss, grads, info = self.model.loss_and_backward(toks)
-            if not math.isfinite(loss):
-                raise RuntimeError(f"non-finite loss at step {self.sched.global_step}")
-            # gradient clipping (global norm); chunk so the float64 scratch
-            # stays bounded on large parameter sets.
-            total_sq = 0.0
-            for g in grads.values():
-                flat = np.asarray(g).reshape(-1)
-                for i in range(0, flat.size, 1 << 20):
-                    c = np.asarray(flat[i:i + (1 << 20)], dtype=np.float64)
-                    total_sq += float(c @ c)
-            total = math.sqrt(total_sq)
-            if not math.isfinite(total):
-                raise RuntimeError(f"non-finite gradient norm at step {self.sched.global_step}")
-            if total > grad_clip and total > 0:
-                scale = grad_clip / total
-                for g in grads.values():
-                    g *= scale
-            # Training never consumes per-parameter update norms; skip their
-            # extra full-array reductions unless an explicit caller requests them.
-            self.opt.step(self.model.p, grads, collect_norms=False)
-            # Only parameters with gradients were updated in-place. Invalidate
-            # their quantized representations, not every projection in the model.
-            self.model.packed.invalidate(grads.keys())
-            self.model.fp8.invalidate(grads.keys())
-            if self.model.store is not None and self.spec.kind == "moe":
-                changed_experts = set()
-                for name in grads:
-                    parts = name.split(".")
-                    if len(parts) == 3 and parts[0] == "expert" and parts[2] in ("Win", "Wout"):
-                        changed_experts.add(int(parts[1]))
-                for eid in changed_experts:
-                    self.model.store.write_back(eid, _expert_dict(self.model.p, eid))
-            # 1-4: step counter, smoothing, triggers, single pending creation
-            reason = self.sched.note_optimizer_step(loss)
-            self.last_metrics = {"step": self.sched.global_step, "loss": float(loss),
-                                 "smooth_loss": self.sched.smooth_loss,
-                                 "overflow_dropped": int(info.get("overflow_dropped", 0)),
-                                 "loss_main": float(info.get("loss_main", loss)),
-                                 "mtp_losses": list(info.get("mtp_losses", []))}
-            if reason is not None and self.sched.pending is None:
-                if self.spec.kind != "moe":
-                    self.log.append({"event": "growth-skipped-dense",
-                                     "step": self.sched.global_step})
-                else:
-                    self.sched.create_pending(reason)
-            # resolve immediately (same step): ranking -> prepare -> commit
-            if self.sched.pending is not None:
-                try:
+        try:
+            while True:
+                if max_steps is not None and self.sched.global_step >= max_steps:
+                    break
+                # A pending event must be resolved BEFORE any further optimizer update.
+                if self.sched.pending is not None:
                     self._resolve_pending(fail_at=growth_fail_at)
-                except _NeedEvidence as e:
-                    # training updates are paused while evidence is collected
-                    raise RuntimeError(f"growth blocked at step {self.sched.global_step}: {e}")
-            steps += 1
-            if log_every and steps % log_every == 0:
-                self.log.append({"step": self.sched.global_step, "loss": loss,
-                                 "smooth": self.sched.smooth_loss,
-                                 "loss_main": float(info.get("loss_main", loss)),
-                                 "mtp_losses": list(info.get("mtp_losses", [])),
-                                 "overflow_dropped": int(info.get("overflow_dropped", 0))})
-            if ckpt_every and self.sched.global_step % ckpt_every == 0:
-                self.save()
-            if fail_at == "after_step":
-                raise _Injected(fail_at)
+                    continue
+                with _atomic_step(self.algorithm == "dust"):
+                    toks = self.stream.next_tokens(self.args.seq_len)
+                    if self.algorithm == "dust":
+                        loss, grads, info = self.dust.loss_and_gradients(
+                            toks, step=self.sched.global_step)
+                    else:
+                        loss, grads, info = self.model.loss_and_backward(toks)
+                    if not math.isfinite(loss):
+                        raise RuntimeError(f"non-finite loss at step {self.sched.global_step}")
+                    # gradient clipping (global norm); chunk so the float64 scratch
+                    # stays bounded on large parameter sets.
+                    total_sq = 0.0
+                    for g in grads.values():
+                        flat = np.asarray(g).reshape(-1)
+                        for i in range(0, flat.size, 1 << 20):
+                            c = np.asarray(flat[i:i + (1 << 20)], dtype=np.float64)
+                            total_sq += float(c @ c)
+                    total = math.sqrt(total_sq)
+                    if not math.isfinite(total):
+                        raise RuntimeError(f"non-finite gradient norm at step {self.sched.global_step}")
+                    clip_value = (self.dust_config.grad_clip
+                                  if self.algorithm == "dust" else grad_clip)
+                    if clip_value and total > clip_value and total > 0:
+                        scale = clip_value / total
+                        for g in grads.values():
+                            g *= scale
+                    # Training never consumes per-parameter update norms; skip their
+                    # extra full-array reductions unless an explicit caller requests them.
+                    self.opt.step(self.model.p, grads, collect_norms=False)
+                    # Only parameters with gradients were updated in-place. Invalidate
+                    # their quantized representations, not every projection in the model.
+                    self.model.packed.invalidate(grads.keys())
+                    self.model.fp8.invalidate(grads.keys())
+                    if self.model.store is not None and self.spec.kind == "moe":
+                        changed_experts = set()
+                        for name in grads:
+                            parts = name.split(".")
+                            if len(parts) == 3 and parts[0] == "expert" and parts[2] in ("Win", "Wout"):
+                                changed_experts.add(int(parts[1]))
+                        for eid in changed_experts:
+                            self.model.store.write_back(eid, _expert_dict(self.model.p, eid))
+                    # 1-4: step counter, smoothing, triggers, single pending creation
+                    reason = self.sched.note_optimizer_step(loss)
+                dust_info = info.get("dust") if self.algorithm == "dust" else None
+                self.last_metrics = {"step": self.sched.global_step, "loss": float(loss),
+                                     "smooth_loss": self.sched.smooth_loss,
+                                     "algorithm": self.algorithm,
+                                     "overflow_dropped": int(info.get("overflow_dropped", 0)),
+                                     "loss_main": float(info.get("loss_main", loss)),
+                                     "mtp_losses": list(info.get("mtp_losses", []))}
+                if dust_info is not None:
+                    self.last_metrics["dust"] = dust_info
+                if reason is not None and self.sched.pending is None:
+                    if self.spec.kind != "moe":
+                        self.log.append({"event": "growth-skipped-dense",
+                                         "step": self.sched.global_step})
+                    else:
+                        self.sched.create_pending(reason)
+                # resolve immediately (same step): ranking -> prepare -> commit
+                if self.sched.pending is not None:
+                    try:
+                        self._resolve_pending(fail_at=growth_fail_at)
+                    except _NeedEvidence as e:
+                        # training updates are paused while evidence is collected
+                        raise RuntimeError(f"growth blocked at step {self.sched.global_step}: {e}")
+                steps += 1
+                record = {"step": self.sched.global_step, "loss": loss,
+                          "smooth": self.sched.smooth_loss,
+                          "loss_main": float(info.get("loss_main", loss)),
+                          "mtp_losses": list(info.get("mtp_losses", [])),
+                          "overflow_dropped": int(info.get("overflow_dropped", 0)),
+                          "algorithm": self.algorithm}
+                if dust_info is not None:
+                    record["dust"] = {
+                        key: dust_info[key] for key in
+                        ("full_forward_equivalents", "draws", "head_draws",
+                         "local_draws", "scalar_forwards", "clean_cache_bytes",
+                         "estimator_bytes", "total_s")}
+                if log_every and steps % log_every == 0:
+                    self.log.append(record)
+                if ckpt_every and self.sched.global_step % ckpt_every == 0:
+                    self.save()
+                if fail_at == "after_step":
+                    raise _Injected(fail_at)
+        except KeyboardInterrupt:
+            # The atomic checkpoint format resumes exactly at a committed step.
+            self.save()
+            raise
         if ckpt_every:
             self.save()
         return self.log
