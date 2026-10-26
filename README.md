@@ -161,21 +161,23 @@ it transparently falls back to a NumPy decode-and-multiply path. FP8 is
 software-emulated on CPU.
 
 Packed ternary is faster for complete training steps on the dense workload.
-In the latest low-load run on `dense-tiny` at sequence 512, with optimizer
-updates and re-packing included, the measured step was 181.8 ms versus
-229.0 ms for FP32 (1.26x); forward was 83.3 ms versus 142.8 ms (1.72x).
-Backward was 84.4 ms versus 73.6 ms because the straight-through weight
-gradient remains an FP32 GEMM even though the input gradient comes from packed
-weights. At sequence 64 the step was about 1.03x faster. Absolute times vary
-with host state, so use the within-run ratios; an earlier baseline is retained
-in git history. The benchmark drives the production `Model` / `npgrad` /
-`SmaulOPT` path; only the kernel A/B table uses direct C calls.
+In the latest run on `dense-tiny` at sequence 512 (1-minute load average
+1.2-1.4, a browser sharing the CPU), with optimizer updates and re-packing
+included, the measured step was 117.9 ms versus 175.3 ms for FP32 (1.49x);
+forward was 59.9 ms versus 120.9 ms (2.02x). Backward was 52.0 ms versus
+46.4 ms because the straight-through weight gradient remains an FP32 GEMM even
+though the input gradient comes from packed weights. At sequence 64 the step
+was 42.1 ms versus 45.5 ms (1.08x); with frozen weights at sequence 512 the
+step was 100.9 ms versus 154.4 ms (1.53x). Absolute times vary with host state,
+so use the within-run ratios; earlier baselines remain in git history. The
+benchmark drives the production `Model` / `npgrad` / `SmaulOPT` path; only the
+kernel A/B table uses direct C calls.
 
-Re-packing after an optimizer step now uses one batched native call and views
-into a single packed allocation, reducing the pack of 105 dense-tiny matrices
-from about 2.0 ms to 0.9 ms. SiLU also runs its sigmoid ufuncs in place with
-bitwise-identical full-precision results, saving roughly 2-5 ms per
-sequence-512 forward. See
+The current path includes a native 2-D recurrent scan, a bitwise-equivalent
+fused RMSNorm node, exact in-place SiLU/sigmoid, one batched SmaulOPT call for
+all factored matrices, and one batched packed-weight refresh. The scan alone
+falls from about 2.3 ms to 0.15 ms for a sequence-511, width-32 forward plus
+backward in the microbenchmark. See
 [`benchmarks/TERNARY_RESULTS.md`](benchmarks/TERNARY_RESULTS.md) for the frozen
 pure-compute comparison, kernel A/B numbers, STE weight-gradient investigation,
 full-step profile, and reproduction commands:
