@@ -72,8 +72,7 @@ def pack_ternary(W: np.ndarray):
         scale_out = ctypes.c_float(1.0)
         threshold_out = ctypes.c_float(0.0)
         status = _NATIVE_LIB.smaulbrain_pack_ternary(
-            arr.ctypes.data_as(ctypes.POINTER(ctypes.c_float)),
-            packed.ctypes.data_as(ctypes.POINTER(ctypes.c_uint8)),
+            arr.ctypes.data, packed.ctypes.data,
             n, ctypes.byref(scale_out), ctypes.byref(threshold_out))
         if status != 0:
             raise RuntimeError(f"native ternary packing failed with status {status}")
@@ -107,8 +106,7 @@ def pack_ternary_tiled(W: np.ndarray):
         scale_out = ctypes.c_float(1.0)
         threshold_out = ctypes.c_float(0.0)
         if _NATIVE_LIB.smaulbrain_pack_ternary_tiled(
-                arr.ctypes.data_as(ctypes.POINTER(ctypes.c_float)),
-                buf.ctypes.data_as(ctypes.POINTER(ctypes.c_uint8)),
+                arr.ctypes.data, buf.ctypes.data,
                 d_in, d_out, ctypes.byref(scale_out), ctypes.byref(threshold_out)) == 0:
             return (TiledPacked(buf), np.float32(scale_out.value), arr.shape,
                     np.float32(threshold_out.value))
@@ -118,9 +116,7 @@ def pack_ternary_tiled(W: np.ndarray):
         packed = np.ascontiguousarray(packed, dtype=np.uint8)
         buf = np.empty(((d_out + 15) // 16) * d_in * 4, dtype=np.uint8)
         if _NATIVE_LIB.smaulbrain_retile_ternary(
-                packed.ctypes.data_as(ctypes.POINTER(ctypes.c_uint8)),
-                buf.ctypes.data_as(ctypes.POINTER(ctypes.c_uint8)),
-                d_in, d_out) == 0:
+                packed.ctypes.data, buf.ctypes.data, d_in, d_out) == 0:
             return TiledPacked(buf), scale, shape, th
     return packed, scale, shape, th
 
@@ -145,9 +141,7 @@ def retile_ternary(packed, shape):
     p = np.ascontiguousarray(p, dtype=np.uint8)
     buf = np.empty(((d_out + 15) // 16) * d_in * 4, dtype=np.uint8)
     if _NATIVE_LIB.smaulbrain_retile_ternary(
-            p.ctypes.data_as(ctypes.POINTER(ctypes.c_uint8)),
-            buf.ctypes.data_as(ctypes.POINTER(ctypes.c_uint8)),
-            d_in, d_out) != 0:
+            p.ctypes.data, buf.ctypes.data, d_in, d_out) != 0:
         return None
     return buf
 
@@ -296,19 +290,25 @@ def prepare_ternary_backend() -> bool:
         lib.smaulbrain_ternary_matmat.restype = ctypes.c_int
         lib.smaulbrain_ternary_transpose_matmat.argtypes = argtypes
         lib.smaulbrain_ternary_transpose_matmat.restype = ctypes.c_int
-        lib.smaulbrain_tiled_matmat.argtypes = argtypes
+        # Hot tiled/packing entry points take raw addresses (c_void_p). This
+        # avoids one ctypes.cast allocation per tensor per call; model training
+        # invokes these entry points hundreds of times per optimizer step.
+        argtypes_addr = [ctypes.c_void_p, ctypes.c_void_p, ctypes.c_float,
+                         ctypes.c_void_p, ctypes.c_size_t, ctypes.c_size_t,
+                         ctypes.c_size_t]
+        lib.smaulbrain_tiled_matmat.argtypes = argtypes_addr
         lib.smaulbrain_tiled_matmat.restype = ctypes.c_int
-        lib.smaulbrain_tiled_transpose_matmat.argtypes = argtypes
+        lib.smaulbrain_tiled_transpose_matmat.argtypes = argtypes_addr
         lib.smaulbrain_tiled_transpose_matmat.restype = ctypes.c_int
         lib.smaulbrain_retile_ternary.argtypes = [
-            ptr_u8, ptr_u8, ctypes.c_size_t, ctypes.c_size_t]
+            ctypes.c_void_p, ctypes.c_void_p, ctypes.c_size_t, ctypes.c_size_t]
         lib.smaulbrain_retile_ternary.restype = ctypes.c_int
         lib.smaulbrain_pack_ternary_tiled.argtypes = [
-            ptr_f32, ptr_u8, ctypes.c_size_t, ctypes.c_size_t,
+            ctypes.c_void_p, ctypes.c_void_p, ctypes.c_size_t, ctypes.c_size_t,
             ctypes.POINTER(ctypes.c_float), ctypes.POINTER(ctypes.c_float)]
         lib.smaulbrain_pack_ternary_tiled.restype = ctypes.c_int
         lib.smaulbrain_pack_ternary.argtypes = [
-            ptr_f32, ptr_u8, ctypes.c_size_t,
+            ctypes.c_void_p, ctypes.c_void_p, ctypes.c_size_t,
             ctypes.POINTER(ctypes.c_float), ctypes.POINTER(ctypes.c_float)]
         lib.smaulbrain_pack_ternary.restype = ctypes.c_int
         lib.smaulbrain_recurrent_scan.argtypes = [
@@ -587,11 +587,8 @@ def packed_matmat(X: np.ndarray, packed: np.ndarray, shape, scale: float,
         x = np.ascontiguousarray(x, dtype=np.float32)
         out = np.empty((x.shape[0], d_out), dtype=np.float32)
         if _NATIVE_LIB.smaulbrain_tiled_matmat(
-                x.ctypes.data_as(ctypes.POINTER(ctypes.c_float)),
-                packed.buf.ctypes.data_as(ctypes.POINTER(ctypes.c_uint8)),
-                ctypes.c_float(float(scale)),
-                out.ctypes.data_as(ctypes.POINTER(ctypes.c_float)),
-                x.shape[0], d_in, d_out) != 0:
+                x.ctypes.data, packed.buf.ctypes.data, float(scale),
+                out.ctypes.data, x.shape[0], d_in, d_out) != 0:
             raise RuntimeError("native tiled ternary matmat failed")
         return out[0] if one_row else out
     p, d_in, d_out = _check_packed_shape(packed, shape)
@@ -663,11 +660,8 @@ def packed_matmat_transpose(dY: np.ndarray, packed: np.ndarray, shape,
         dy = np.ascontiguousarray(dy, dtype=np.float32)
         dx = np.empty((dy.shape[0], d_in), dtype=np.float32)
         if _NATIVE_LIB.smaulbrain_tiled_transpose_matmat(
-                dy.ctypes.data_as(ctypes.POINTER(ctypes.c_float)),
-                packed.buf.ctypes.data_as(ctypes.POINTER(ctypes.c_uint8)),
-                ctypes.c_float(float(scale)),
-                dx.ctypes.data_as(ctypes.POINTER(ctypes.c_float)),
-                dy.shape[0], d_in, d_out) != 0:
+                dy.ctypes.data, packed.buf.ctypes.data, float(scale),
+                dx.ctypes.data, dy.shape[0], d_in, d_out) != 0:
             raise RuntimeError("native tiled ternary transpose matmat failed")
         return dx[0] if one_row else dx
     p, d_in, d_out = _check_packed_shape(packed, shape)
