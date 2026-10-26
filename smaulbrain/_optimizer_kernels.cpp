@@ -263,3 +263,33 @@ extern "C" int smaulbrain_smaulopt_factored(
         return 2;
     }
 }
+
+// Batch wrapper: one FFI crossing for all factored matrices in an optimizer
+// step. Each matrix uses the exact same fused kernel and arithmetic as the
+// single-matrix entry point, so results are unchanged; this only removes
+// per-matrix ctypes and argument-conversion overhead from the Python loop.
+extern "C" int smaulbrain_smaulopt_factored_many(
+    const std::uintptr_t* w_ptrs, const std::uintptr_t* m_ptrs,
+    const std::uintptr_t* g_ptrs, const std::uintptr_t* R_ptrs,
+    const std::uintptr_t* C_ptrs, const std::size_t* rows,
+    const std::size_t* cols, std::size_t count,
+    float beta1, float omb1, float beta2, float omb2, float eps, float lr,
+    float decay, int want_norm, double* upd_sq_sums) noexcept {
+    if (count == 0) return 0;
+    if (!w_ptrs || !m_ptrs || !g_ptrs || !R_ptrs || !C_ptrs || !rows || !cols)
+        return 1;
+    for (std::size_t i = 0; i < count; ++i) {
+        double sq = 0.0;
+        const int rc = smaulbrain_smaulopt_factored(
+            reinterpret_cast<float*>(w_ptrs[i]),
+            reinterpret_cast<float*>(m_ptrs[i]),
+            reinterpret_cast<const float*>(g_ptrs[i]),
+            reinterpret_cast<float*>(R_ptrs[i]),
+            reinterpret_cast<float*>(C_ptrs[i]),
+            rows[i], cols[i], beta1, omb1, beta2, omb2, eps, lr, decay,
+            want_norm, &sq);
+        if (rc != 0) return rc;
+        if (upd_sq_sums) upd_sq_sums[i] = sq;
+    }
+    return 0;
+}
