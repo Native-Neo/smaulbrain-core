@@ -434,6 +434,7 @@ class Model:
             idx, weights, info = self._route(
                 X, top_k, None if no_drop else self.capacity_factor, disabled)
         Y = Tensor(np.zeros_like(X.data))
+        updates = []
         flat = idx.reshape(-1)
         order = np.argsort(flat, kind="stable")
         counts = np.bincount(flat[order], minlength=p["router"].shape[1])
@@ -450,10 +451,12 @@ class Model:
             try:
                 yb = self._expert(X[rows], eid)
                 wt = weights[rows, cols].reshape(-1, 1)
-                Y = ng.index_add_rows(Y, rows, wt * yb)
+                updates.append((rows, wt * yb))
             finally:
                 if self.store is not None:
                     self.store.unpin(eid)
+        if updates:
+            Y = ng.index_add_rows_many(Y, updates)
         return Y, info
 
     @staticmethod
