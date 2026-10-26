@@ -119,12 +119,25 @@ def _scan_chunk_size(alpha):
 def _scan(values, alpha):
     """s_t = alpha * s_{t-1} + values_t for every position.
 
-    Mirrors ``npgrad._scan_forward`` and accepts leading draw axes, so a
-    population of independent sequences can be evaluated together.
+    Mirrors the active ``npgrad`` scan implementation and accepts leading draw
+    axes, so a population of independent sequences can be evaluated together.
+    The single-sequence path shares the native sequential kernel with the
+    autograd runtime, keeping Dust's clean forward on the same scan path as
+    ``Model._forward_impl`` when that backend is available.
     """
     v = np.asarray(values, dtype=np.float32)
     a = np.asarray(alpha, dtype=np.float32)
     one_dim = v.ndim == 2
+    if (one_dim and v.flags.c_contiguous and a.flags.c_contiguous
+            and v.shape[1] == a.shape[0]):
+        from . import _quant_native as _qn
+        if _qn._NATIVE_LIB is None:
+            _qn.prepare_ternary_backend()
+        if _qn._NATIVE_LIB is not None:
+            states = np.empty_like(v)
+            state = np.zeros(v.shape[1], dtype=np.float32)
+            if _qn.recurrent_scan(v, a, state, states):
+                return states
     if one_dim:
         v = v[None, :, :]
     lead = v.shape[:-2]
