@@ -2,11 +2,13 @@
 from __future__ import annotations
 
 import math
+import time
 
 import numpy as np
 
 from . import config as _cfg, moe as _moe, ops as _ops, quant as _quant
 from . import npgrad as ng
+from . import precision as _precision
 from .npgrad import Parameter, Tensor, as_tensor
 
 
@@ -126,11 +128,13 @@ class FP8Cache:
 
 
 def _weight_grad(X, dY):
-    if X.ndim == 1:
-        X = X.reshape(1, -1)
-    if dY.ndim == 1:
-        dY = dY.reshape(1, -1)
-    return X.data.T @ dY.data
+    x = X.data if isinstance(X, Tensor) else np.asarray(X)
+    dy = dY.data if isinstance(dY, Tensor) else np.asarray(dY)
+    if x.ndim == 1:
+        x = x.reshape(1, -1)
+    if dy.ndim == 1:
+        dy = dy.reshape(1, -1)
+    return x.T @ dy
 
 
 def _quantized_linear(X, W, Wq, kind, backward_mode, packed, scale, shape):
@@ -162,6 +166,25 @@ def _quantized_linear(X, W, Wq, kind, backward_mode, packed, scale, shape):
     return ng.make_op(out, (X, W), bw)
 
 
+def _graph_storage_stats(root):
+    """Storage bytes held by non-parameter tensors reachable from ``root``."""
+    seen = set()
+    stack = [root]
+    total = 0
+    formats = {}
+    while stack:
+        tensor = stack.pop()
+        if id(tensor) in seen:
+            continue
+        seen.add(id(tensor))
+        if not isinstance(tensor, Parameter):
+            total += tensor.storage_nbytes
+            kind = tensor.storage_dtype
+            formats[kind] = formats.get(kind, 0) + 1
+        stack.extend(tensor._parents)
+    return {"bytes": int(total), "formats": formats, "tensors": len(seen)}
+
+
 class _QuantLinear:
     @staticmethod
     def apply(X, W, Wq, kind, backward_mode, packed, scale, shape):
@@ -172,7 +195,8 @@ class Model:
     def __init__(self, spec, params: dict, forward_quant="fp32", backward_mode="fp32",
                  paging_mode="R", paging_store=None, loss_smooth_beta=0.99,
                  capacity_factor: float = 1.25, device="cpu",
-                 mtp_depth: int = 0, mtp_loss_weight: float = 0.1):
+                 mtp_depth: int = 0, mtp_loss_weight: float = 0.1,
+                 activation_storage: str = "fp32", gradient_storage: str = "fp32"):
         _cfg.validate_quant_combo(forward_quant, backward_mode)
         self.spec = spec
         self.device = str(device)
@@ -189,6 +213,8 @@ class Model:
             raise ValueError("mtp_loss_weight must be a finite non-negative number")
         self.forward_quant = forward_quant
         self.backward_mode = backward_mode
+        self.activation_storage = _precision.validate_activation_storage(activation_storage)
+        self.gradient_storage = _precision.validate_gradient_storage(gradient_storage)
         self.paging_mode = paging_mode
         self.store = paging_store
         self.packed = PackedCache()
@@ -250,7 +276,8 @@ class Model:
         n = len(expert_ids(self.p)) if self.spec.kind == "moe" else 0
         rep = _cfg.arch_report(self.spec, n, mtp_depth=self.mtp_depth)
         rep.update(forward_quant=self.forward_quant, backward_mode=self.backward_mode,
-                   paging_mode=self.paging_mode)
+                   paging_mode=self.paging_mode, activation_storage=self.activation_storage,
+                   gradient_storage=self.gradient_storage)
         return rep
 
     def zero_grad(self, set_to_none=True):
@@ -258,7 +285,7 @@ class Model:
             if set_to_none:
                 value.grad = None
             elif value.grad is not None:
-                value.grad[...] = 0
+                _precision.zero_gradient(value.grad)
 
     def train(self, mode=True):
         return self
@@ -360,8 +387,11 @@ class Model:
     def _moe(self, X, disabled=(), no_drop=False):
         p = self.p
         top_k = self.spec.top_k
-        idx, weights, info = self._route(
-            X, top_k, None if no_drop else self.capacity_factor, disabled)
+        # Router scores/weights remain fp32: reduced activation storage must
+        # not perturb expert selection or capacity accounting.
+        with _precision.activation_storage("fp32"):
+            idx, weights, info = self._route(
+                X, top_k, None if no_drop else self.capacity_factor, disabled)
         Y = Tensor(np.zeros_like(X.data))
         flat = idx.reshape(-1)
         order = np.argsort(flat, kind="stable")
@@ -387,7 +417,10 @@ class Model:
 
     @staticmethod
     def _rmsnorm(X, gain):
-        return X * ng.rsqrt(X.square().mean(dim=-1, keepdim=True) + _ops.EPS) * gain
+        # Normalization statistics stay at full precision even when activation
+        # storage is reduced.
+        with _precision.activation_storage("fp32"):
+            return X * ng.rsqrt(X.square().mean(dim=-1, keepdim=True) + _ops.EPS) * gain
 
     def _mtp_module(self, k, H, tok_in, state=None):
         p = self.p
@@ -399,7 +432,8 @@ class Model:
         A = self._rmsnorm(U, p[px + "n1"])
         O, s = self._attn(A, px, state)
         Y = U + O
-        logits = self._rmsnorm(Y, p[px + "on"]) @ ng.transpose(p["embed"])
+        with _precision.activation_storage("fp32"):
+            logits = self._rmsnorm(Y, p[px + "on"]) @ ng.transpose(p["embed"])
         return logits, Y, s
 
     def _mtp_losses(self, X, tok):
@@ -444,7 +478,8 @@ class Model:
             else:
                 states[i] = s1.detach().data
         H = self._rmsnorm(X, p["final_norm"])
-        logits = H @ ng.transpose(p["embed"])
+        with _precision.activation_storage("fp32"):
+            logits = H @ ng.transpose(p["embed"])
         self._last_aux = aux
         out_states = states if states is not None else new_states
         if return_hidden or capture_states:
@@ -453,18 +488,23 @@ class Model:
 
     def forward(self, tokens, states=None, train=False, disabled=()):
         if train:
-            return self._forward_impl(tokens, states, disabled)[0], self._last_aux
+            with _precision.activation_storage(self.activation_storage):
+                return self._forward_impl(tokens, states, disabled)[0], self._last_aux
         with ng.no_grad():
             return self._forward_impl(tokens, states, disabled)
 
-    def loss_and_backward(self, tokens):
+    def loss_and_backward(self, tokens, profile=False):
         tok = np.asarray(tokens.data if isinstance(tokens, Tensor) else tokens, dtype=np.int64).reshape(-1)
         if tok.size < 2:
             raise ValueError("training sequence needs at least two tokens")
         self.zero_grad(set_to_none=True)
         self._paged_leaves = {}
         mtp_losses = []
-        with ng.enable_grad():
+        started = time.perf_counter()
+        activation_stats = None
+        forward_seconds = backward_seconds = None
+        with ng.enable_grad(), _precision.activation_storage(self.activation_storage), \
+                _precision.gradient_storage(self.gradient_storage):
             logits, _, det = self._forward_impl(tok[:-1], return_hidden=True)
             loss_main = ng.cross_entropy(logits, tok[1:])
             loss = loss_main
@@ -472,20 +512,41 @@ class Model:
                 for lk in self._mtp_losses(det["hidden"], tok):
                     mtp_losses.append(float(lk.detach().item()))
                     loss = loss + self.mtp_loss_weight * lk
-            loss.backward()
+            if profile:
+                forward_seconds = time.perf_counter() - started
+                activation_stats = _graph_storage_stats(loss)
+                mark = time.perf_counter()
+            loss.backward(release_intermediate=True)
+            if profile:
+                backward_seconds = time.perf_counter() - mark
         p = self.p
         for (eid, suffix), leaf in self._paged_leaves.items():
             target = p[f"expert.{eid}.{suffix}"]
             if leaf.grad is not None:
+                merged = _precision.gradient_array(leaf.grad)
                 if target.grad is None:
-                    target.grad = leaf.grad.copy()
+                    target.grad = _precision.store_gradient(merged, self.gradient_storage)
                 else:
-                    target.grad += leaf.grad
-        grads = {k: v.grad.copy() for k, v in p.items() if v.grad is not None}
+                    target.grad = _precision.store_gradient(
+                        _precision.gradient_array(target.grad) + merged,
+                        self.gradient_storage)
+        if self.gradient_storage == "bf16":
+            grads = {k: v.grad for k, v in p.items() if v.grad is not None}
+        else:
+            grads = {k: v.grad.copy() for k, v in p.items() if v.grad is not None}
         out = float(loss.detach().item())
         aux = dict(self._last_aux)
         aux["loss_main"] = float(loss_main.detach().item())
         aux["mtp_losses"] = mtp_losses
+        if profile:
+            aux["profile"] = {
+                "forward_s": forward_seconds,
+                "backward_s": backward_seconds,
+                "activation_cache": activation_stats,
+                "gradient_bytes": int(sum(
+                    g.nbytes if isinstance(g, _precision.PackedGradient)
+                    else np.asarray(g).nbytes for g in grads.values())),
+            }
         del logits, det, loss, loss_main
         self._paged_leaves = {}
         self.zero_grad(set_to_none=True)
