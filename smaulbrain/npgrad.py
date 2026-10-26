@@ -667,15 +667,30 @@ def softplus(a):
 def silu(a):
     a = _t(a)
     full = _full_precision_storage()
-    x = a.data.astype(np.float64) if full else a.data
-    s = 1.0 / (1.0 + np.exp(-x))
-    out = (x * s).astype(a.dtype)
-    held_grad = None
+    # Carry the sigmoid in-place. Every ufunc has the same operand order and
+    # rounding as the allocating form, but avoids several full-size temporaries
+    # in a layer that runs for every FFN block.
     if full:
+        x = a.data.astype(np.float64)
+        np.negative(x, out=x)
+        np.exp(x, out=x)
+        np.add(x, 1.0, out=x)
+        np.divide(1.0, x, out=x)
+        s = x
+        out = (a.data * s).astype(a.dtype)
         # The fp32 path already has the activation in the graph, so keeping its
         # derivative avoids recomputation.  Reduced storage drops it and
         # recomputes in backward instead of retaining another full-size cache.
-        held_grad = (s * (1.0 + x * (1.0 - s))).astype(a.dtype)
+        held_grad = (s * (1.0 + a.data * (1.0 - s))).astype(a.dtype)
+    else:
+        # Do not mutate the graph's activation: negate into a fresh float32
+        # buffer, then reuse it for exp and the sigmoid.
+        s = np.negative(a.data)
+        np.exp(s, out=s)
+        np.add(s, 1.0, out=s)
+        np.divide(1.0, s, out=s)
+        out = (a.data * s).astype(a.dtype)
+        held_grad = None
 
     def bw(g):
         if held_grad is None:
