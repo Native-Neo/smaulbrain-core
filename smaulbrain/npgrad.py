@@ -7,9 +7,11 @@ per scalar element.
 
 Design notes
 ------------
-* Runtime dtype is float32 (matching the original torch graph). A few
-  reductions (``sigmoid`` inputs, cross entropy, gradient norms) use float64
-  internally exactly where the reference implementation did.
+* Runtime dtype is float32 (matching the original torch graph). The FP32
+  reference path uses float64 for a few nonlinear/reduction intermediates
+  exactly where the original did.  When BF16/INT8 activation storage is active,
+  nonlinear forward/backward math uses float32 because it is far below the
+  storage quantization step and avoids conversion overhead.
 * Recurrent reads use a chunked closed-form scan (see :func:`scan`) so there is
   no Python loop over positions or elements. The chunk size adapts to the decay
   magnitude to avoid overflow.
@@ -20,7 +22,11 @@ from __future__ import annotations
 
 import contextlib
 import math
+import weakref
+
 import numpy as np
+
+from . import precision as _precision
 
 DTYPE = np.float32
 _grad_enabled = True
@@ -89,10 +95,19 @@ def inference_mode():
 class Tensor:
     __array_priority__ = 1000
 
-    def __init__(self, data, requires_grad=False, _parents=(), _backward=None):
+    def __init__(self, data, requires_grad=False, _parents=(), _backward=None,
+                 _store=False):
         if isinstance(data, Tensor):
             data = data.data
-        self.data = np.asarray(data)
+        arr = np.asarray(data)
+        self._data = arr
+        self._stored = None
+        if _store and _precision.should_store(arr):
+            # Keep only the compressed representation.  Forward/backward code
+            # sees a fresh float32 view through ``data`` when it needs one.
+            self._stored = _precision.StoredArray.compress(
+                arr, _precision.get_activation_storage())
+            self._data = None
         self.requires_grad = bool(requires_grad)
         self.grad = None
         self._parents = tuple(_parents)
@@ -100,16 +115,40 @@ class Tensor:
 
     # -- basic properties --------------------------------------------------
     @property
+    def data(self):
+        if self._stored is not None:
+            return self._stored.dequantize()
+        return self._data
+
+    @property
     def shape(self):
-        return self.data.shape
+        if self._stored is not None:
+            return self._stored.shape
+        return self._data.shape
 
     @property
     def ndim(self):
-        return self.data.ndim
+        return len(self.shape)
 
     @property
     def dtype(self):
-        return self.data.dtype
+        if self._stored is not None:
+            return self._stored.logical_dtype
+        return self._data.dtype
+
+    @property
+    def storage_dtype(self):
+        """Physical format of the cached value (``fp32``, ``bf16`` or ``int8``)."""
+        if self._stored is not None:
+            return self._stored.storage_dtype
+        return "fp32"
+
+    @property
+    def storage_nbytes(self):
+        """Bytes actually held by this tensor's cached value."""
+        if self._stored is not None:
+            return self._stored.nbytes
+        return int(self._data.nbytes)
 
     @property
     def device(self):
@@ -120,13 +159,13 @@ class Tensor:
         return transpose(self)
 
     def numel(self):
-        return int(self.data.size)
+        return int(np.prod(self.shape, dtype=np.int64))
 
     def dim(self):
-        return self.data.ndim
+        return self.ndim
 
     def size(self, dim=None):
-        return self.data.size if dim is None else self.data.shape[dim]
+        return int(np.prod(self.shape, dtype=np.int64)) if dim is None else self.shape[dim]
 
     def item(self):
         return self.data.item()
@@ -152,11 +191,12 @@ class Tensor:
     def to(self, dtype=None, device=None, **kwargs):
         if dtype is not None:
             dtype = np.dtype(dtype)
-            if dtype != self.data.dtype:
+            if dtype != self.dtype:
+                current = self.dtype
                 if (np.issubdtype(dtype, np.floating)
-                        and np.issubdtype(self.data.dtype, np.floating)):
+                        and np.issubdtype(current, np.floating)):
                     out = self.data.astype(dtype)
-                    return make_op(out, (self,), lambda g: (g.astype(self.data.dtype),))
+                    return make_op(out, (self,), lambda g: (g.astype(current),))
                 return Tensor(self.data.astype(dtype), self.requires_grad)
         return self
 
@@ -256,51 +296,72 @@ class Tensor:
         return self.reshape(other.shape)
 
     # -- autograd ----------------------------------------------------------
-    def backward(self, grad=None):
+    def backward(self, grad=None, release_intermediate=False):
         if not self.requires_grad:
             return
         if grad is None:
-            if self.data.size != 1:
+            if self.numel() != 1:
                 raise RuntimeError("grad must be specified for non-scalar output")
             grad = np.ones_like(self.data, dtype=DTYPE)
         elif isinstance(grad, Tensor):
             grad = grad.data
-        grad = np.asarray(grad, dtype=self.data.dtype if np.issubdtype(self.data.dtype, np.floating) else DTYPE)
+        grad = np.asarray(grad, dtype=self.dtype if np.issubdtype(self.dtype, np.floating) else DTYPE)
 
         topo = []
         seen = set()
-
-        def visit(node):
+        # Iterative postorder.  A recursive local function that references
+        # itself creates a reference cycle holding ``topo`` (and therefore
+        # every cached activation) until a generational GC pass.  Avoiding
+        # that cycle lets CPython free each step's graph promptly.
+        stack = [(self, False)]
+        while stack:
+            node, expanded = stack.pop()
             key = id(node)
+            if expanded:
+                topo.append(node)
+                continue
             if key in seen:
-                return
+                continue
             seen.add(key)
-            for parent in node._parents:
+            stack.append((node, True))
+            for parent in reversed(node._parents):
                 if parent.requires_grad:
-                    visit(parent)
-            topo.append(node)
-
-        visit(self)
+                    stack.append((parent, False))
         pending = {id(self): grad}
         for node in reversed(topo):
             g = pending.pop(id(node), None)
             if g is None:
                 continue
             if node.requires_grad:
-                node.grad = g.copy() if node.grad is None else node.grad + g
+                previous = node.grad
+                if isinstance(previous, _precision.PackedGradient):
+                    previous = previous.dequantize()
+                accumulated = g.copy() if previous is None else previous + g
+                if (_precision.get_gradient_storage() == "bf16"
+                        and isinstance(node, Parameter)):
+                    node.grad = _precision.PackedGradient.compress(accumulated)
+                else:
+                    node.grad = accumulated
             if node._backward is None:
                 continue
             parent_grads = node._backward(g)
             if parent_grads is None:
+                if release_intermediate:
+                    node.grad = None
                 continue
             for parent, pg in zip(node._parents, parent_grads):
                 if pg is None or not parent.requires_grad:
                     continue
                 key = id(parent)
                 pg = np.asarray(pg)
-                if np.issubdtype(parent.data.dtype, np.floating) and pg.dtype != parent.data.dtype:
-                    pg = pg.astype(parent.data.dtype)
+                if np.issubdtype(parent.dtype, np.floating) and pg.dtype != parent.dtype:
+                    pg = pg.astype(parent.dtype)
                 pending[key] = pg if key not in pending else pending[key] + pg
+            if release_intermediate:
+                # Non-leaf gradients are only used to propagate this node's
+                # contribution; keeping them alive roughly doubles peak graph
+                # memory during backward.
+                node.grad = None
 
     def zero_grad(self):
         self.grad = None
@@ -359,7 +420,9 @@ class Tensor:
         return getitem(self, key)
 
     def __len__(self):
-        return len(self.data)
+        if self.ndim == 0:
+            raise TypeError("len() of unsized object")
+        return self.shape[0]
 
     def __repr__(self):
         return f"Tensor(shape={self.shape}, dtype={self.dtype}, requires_grad={self.requires_grad})"
@@ -404,14 +467,22 @@ def _unbroadcast(grad, shape):
     return grad.reshape(shape)
 
 
-def make_op(data, inputs, backward):
+def _full_precision_storage():
+    """True when no activation compression is active for new ops."""
+    return _precision.get_activation_storage() == "fp32"
+
+
+def make_op(data, inputs, backward, cache=True):
     """Build a Tensor with an explicit vectorized backward closure.
 
     ``backward(grad)`` must return one gradient (or None) per input.
+    ``cache=False`` keeps a precision-critical result (losses, reduction
+    statistics) in float32 even when reduced-precision activation storage is
+    active.
     """
     inputs = tuple(_t(x) for x in inputs)
     requires = _grad_enabled and any(x.requires_grad for x in inputs)
-    out = Tensor(np.asarray(data), requires)
+    out = Tensor(np.asarray(data), requires, _store=(cache and requires))
     if requires:
         out._parents = inputs
         out._backward = backward
@@ -466,35 +537,62 @@ def neg(a):
 
 def power(a, exponent):
     a = _t(a)
-    e = np.asarray(exponent, dtype=a.data.dtype)
+    e = np.asarray(exponent, dtype=a.dtype)
+    x = a.data
 
     def bw(g):
         return (_unbroadcast(g * e * np.power(a.data, e - 1), a.shape),)
 
-    return make_op(np.power(a.data, e), (a,), bw)
+    return make_op(np.power(x, e), (a,), bw)
 
 
 def square(a):
     a = _t(a)
-    return make_op(a.data * a.data, (a,), lambda g: (_unbroadcast(2.0 * g * a.data, a.shape),))
+    x = a.data
+    return make_op(x * x, (a,), lambda g: (_unbroadcast(2.0 * g * a.data, a.shape),))
 
 
 def sqrt(a):
     a = _t(a)
     out = np.sqrt(a.data)
-    return make_op(out, (a,), lambda g: (_unbroadcast(g * 0.5 / out, a.shape),))
+    full = _full_precision_storage()
+    held = out if full else None
+    holder = []
+
+    def bw(g):
+        current = held if held is not None else holder[0]().data
+        return (_unbroadcast(g * 0.5 / current, a.shape),)
+
+    result = make_op(out, (a,), bw)
+    if not full:
+        # Weak, not strong: a closure strongly holding ``result`` would create
+        # a reference cycle and keep the ancestor subgraph alive until GC.
+        holder.append(weakref.ref(result))
+    return result
 
 
 def rsqrt(a):
     a = _t(a)
     out = np.reciprocal(np.sqrt(a.data))
-    return make_op(out, (a,), lambda g: (_unbroadcast(-0.5 * g * out * out * out, a.shape),))
+    return make_op(out, (a,), lambda g: (_unbroadcast(-0.5 * g * out * out * out, a.shape),),
+                   cache=False)
 
 
 def exp(a):
     a = _t(a)
     out = np.exp(a.data)
-    return make_op(out, (a,), lambda g: (_unbroadcast(g * out, a.shape),))
+    full = _full_precision_storage()
+    held = out if full else None
+    holder = []
+
+    def bw(g):
+        current = held if held is not None else holder[0]().data
+        return (_unbroadcast(g * current, a.shape),)
+
+    result = make_op(out, (a,), bw)
+    if not full:
+        holder.append(weakref.ref(result))
+    return result
 
 
 def log(a):
@@ -509,81 +607,136 @@ def abs_op(a):
 
 def sigmoid(a):
     a = _t(a)
-    out = 0.5 * (1.0 + np.tanh(0.5 * a.data.astype(np.float64)))
-    out = out.astype(a.data.dtype)
+    full = _full_precision_storage()
+    # Reduced storage already carries quantization error; using float32
+    # transcendental math here is far cheaper and does not add a new source of
+    # approximation.  The exact fp32 reference path keeps float64 math.
+    x = a.data.astype(np.float64) if full else a.data
+    out = 0.5 * (1.0 + np.tanh(0.5 * x))
+    out = out.astype(a.dtype)
+    held = out if full else None
+    holder = []
 
     def bw(g):
-        return (_unbroadcast(g * out * (1.0 - out), a.shape),)
+        current = held if held is not None else holder[0]().data
+        return (_unbroadcast(g * current * (1.0 - current), a.shape),)
 
-    return make_op(out, (a,), bw)
+    result = make_op(out, (a,), bw)
+    if not full:
+        holder.append(weakref.ref(result))
+    return result
 
 
 def tanh(a):
     a = _t(a)
     out = np.tanh(a.data)
-    return make_op(out, (a,), lambda g: (_unbroadcast(g * (1.0 - out * out), a.shape),))
+    full = _full_precision_storage()
+    held = out if full else None
+    holder = []
+
+    def bw(g):
+        current = held if held is not None else holder[0]().data
+        return (_unbroadcast(g * (1.0 - current * current), a.shape),)
+
+    result = make_op(out, (a,), bw)
+    if not full:
+        holder.append(weakref.ref(result))
+    return result
 
 
 def softplus(a):
     a = _t(a)
-    out = np.logaddexp(0.0, a.data.astype(np.float64)).astype(a.data.dtype)
-    sig = 1.0 / (1.0 + np.exp(-a.data.astype(np.float64)))
-    sig = sig.astype(a.data.dtype)
+    full = _full_precision_storage()
+    x = a.data.astype(np.float64) if full else a.data
+    out = np.logaddexp(0.0, x).astype(a.dtype)
+    held_sig = None
+    if full:
+        held_sig = (1.0 / (1.0 + np.exp(-x))).astype(a.dtype)
 
     def bw(g):
-        return (_unbroadcast(g * sig, a.shape),)
+        if held_sig is None:
+            x_now = a.data.astype(np.float64) if full else a.data
+            sig_now = (1.0 / (1.0 + np.exp(-x_now))).astype(a.dtype)
+        else:
+            sig_now = held_sig
+        return (_unbroadcast(g * sig_now, a.shape),)
 
     return make_op(out, (a,), bw)
 
 
 def silu(a):
     a = _t(a)
-    x = a.data.astype(np.float64)
+    full = _full_precision_storage()
+    x = a.data.astype(np.float64) if full else a.data
     s = 1.0 / (1.0 + np.exp(-x))
-    out = (x * s).astype(a.data.dtype)
-    grad = (s * (1.0 + x * (1.0 - s))).astype(a.data.dtype)
+    out = (x * s).astype(a.dtype)
+    held_grad = None
+    if full:
+        # The fp32 path already has the activation in the graph, so keeping its
+        # derivative avoids recomputation.  Reduced storage drops it and
+        # recomputes in backward instead of retaining another full-size cache.
+        held_grad = (s * (1.0 + x * (1.0 - s))).astype(a.dtype)
 
     def bw(g):
-        return (_unbroadcast(g * grad, a.shape),)
+        if held_grad is None:
+            x_now = a.data.astype(np.float64) if full else a.data
+            s_now = 1.0 / (1.0 + np.exp(-x_now))
+            grad_now = (s_now * (1.0 + x_now * (1.0 - s_now))).astype(a.dtype)
+        else:
+            grad_now = held_grad
+        return (_unbroadcast(g * grad_now, a.shape),)
 
     return make_op(out, (a,), bw)
 
 
 def gelu(a, approximate="tanh"):
     a = _t(a)
-    x = a.data.astype(np.float64)
     if approximate != "tanh":
         raise NotImplementedError("only tanh GELU is used")
     c = 0.7978845608028654
-    z = c * (x + 0.044715 * x ** 3)
-    t = np.tanh(z)
-    out = (0.5 * x * (1.0 + t)).astype(a.data.dtype)
-    grad = (0.5 * (1.0 + t) + 0.5 * x * (1.0 - t * t) * c * (1.0 + 0.134145 * x * x))
-    grad = grad.astype(a.data.dtype)
+    full = _full_precision_storage()
+    x = a.data.astype(np.float64) if full else a.data
+    t = np.tanh(c * (x + 0.044715 * x ** 3))
+    out = (0.5 * x * (1.0 + t)).astype(a.dtype)
+    held_grad = None
+    if full:
+        held_grad = (0.5 * (1.0 + t)
+                     + 0.5 * x * (1.0 - t * t) * c
+                     * (1.0 + 0.134145 * x * x)).astype(a.dtype)
 
     def bw(g):
-        return (_unbroadcast(g * grad, a.shape),)
+        if held_grad is None:
+            x_now = a.data.astype(np.float64) if full else a.data
+            t_now = np.tanh(c * (x_now + 0.044715 * x_now ** 3))
+            grad_now = (0.5 * (1.0 + t_now)
+                        + 0.5 * x_now * (1.0 - t_now * t_now) * c
+                        * (1.0 + 0.134145 * x_now * x_now))
+            grad_now = grad_now.astype(a.dtype)
+        else:
+            grad_now = held_grad
+        return (_unbroadcast(g * grad_now, a.shape),)
 
     return make_op(out, (a,), bw)
 
 
 def clamp(a, min_value=None, max_value=None):
     a = _t(a)
-    out = a.data
+    x = a.data
+    out = x
     if min_value is not None:
         out = np.maximum(out, min_value)
     if max_value is not None:
         out = np.minimum(out, max_value)
     mask = np.ones(a.shape, dtype=bool)
     if min_value is not None:
-        mask &= a.data >= min_value
+        mask &= x >= min_value
     if max_value is not None:
-        mask &= a.data <= max_value
+        mask &= x <= max_value
 
     def bw(g):
         return (_unbroadcast(g * mask, a.shape),)
 
-    return make_op(out, (a,), bw)
+    return make_op(out, (a,), bw, cache=False)
 
 
 def where(condition, a, b):
@@ -619,7 +772,7 @@ def reshape(a, shape):
 
 def flatten(a):
     a = _t(a)
-    return reshape(a, (a.data.size,))
+    return reshape(a, (a.numel(),))
 
 
 def transpose(a, axes=None):
@@ -645,12 +798,12 @@ def sum(a, axis=None, keepdims=False):
             gg = np.expand_dims(gg, axis)
         return (_unbroadcast(np.broadcast_to(gg, a.shape).copy(), a.shape),)
 
-    return make_op(np.sum(a.data, axis=axis, keepdims=keepdims), (a,), bw)
+    return make_op(np.sum(a.data, axis=axis, keepdims=keepdims), (a,), bw, cache=False)
 
 
 def mean(a, axis=None, keepdims=False):
     a = _t(a)
-    n = a.data.size if axis is None else a.data.shape[axis]
+    n = a.numel() if axis is None else a.shape[axis]
 
     def bw(g):
         gg = np.asarray(g) / n
@@ -658,32 +811,41 @@ def mean(a, axis=None, keepdims=False):
             gg = np.expand_dims(gg, axis)
         return (_unbroadcast(np.broadcast_to(gg, a.shape).copy(), a.shape),)
 
-    return make_op(np.mean(a.data, axis=axis, keepdims=keepdims), (a,), bw)
+    return make_op(np.mean(a.data, axis=axis, keepdims=keepdims), (a,), bw, cache=False)
 
 
 def matmul(a, b):
     a, b = _t(a), _t(b)
     a1 = a.shape
     b1 = b.shape
-    A = a.data[None, :] if a.data.ndim == 1 else a.data
-    B = b.data[:, None] if b.data.ndim == 1 else b.data
     out = a.data @ b.data
+    full = _full_precision_storage()
+    # In fp32 the operands are already held by the graph, so keeping these
+    # views costs no memory.  With compressed storage, capturing them would
+    # decode full float32 copies and defeat the cache saving.
+    A = (a.data[None, :] if a.ndim == 1 else a.data) if full else None
+    B = (b.data[:, None] if b.ndim == 1 else b.data) if full else None
 
     def bw(g):
+        if A is not None:
+            A_now, B_now = A, B
+        else:
+            A_now = a.data[None, :] if a.ndim == 1 else a.data
+            B_now = b.data[:, None] if b.ndim == 1 else b.data
         G = np.asarray(g)
-        if a.data.ndim == 1 and b.data.ndim == 1:
+        if a.ndim == 1 and b.ndim == 1:
             G = G.reshape(1, 1)
-        elif a.data.ndim == 1:
+        elif a.ndim == 1:
             G = G.reshape(1, -1)
-        elif b.data.ndim == 1:
+        elif b.ndim == 1:
             G = G.reshape(-1, 1)
-        ga = np.matmul(G, np.swapaxes(B, -1, -2))
-        gb = np.matmul(np.swapaxes(A, -1, -2), G)
-        ga = _unbroadcast(ga, A.shape)
-        gb = _unbroadcast(gb, B.shape)
-        if a.data.ndim == 1:
+        ga = np.matmul(G, np.swapaxes(B_now, -1, -2))
+        gb = np.matmul(np.swapaxes(A_now, -1, -2), G)
+        ga = _unbroadcast(ga, A_now.shape)
+        gb = _unbroadcast(gb, B_now.shape)
+        if a.ndim == 1:
             ga = ga.reshape(a1)
-        if b.data.ndim == 1:
+        if b.ndim == 1:
             gb = gb.reshape(b1)
         return ga, gb
 
@@ -734,7 +896,9 @@ def getitem(a, key):
     out = a.data[key]
 
     def bw(g):
-        gb = np.zeros_like(a.data)
+        # Only the shape/dtype are needed; decoding a compressed activation
+        # just to allocate its gradient would double transient memory.
+        gb = np.zeros(a.shape, dtype=a.dtype)
         np.add.at(gb, key, g)
         return (gb,)
 
@@ -748,7 +912,7 @@ def gather_last(a, indices):
     out = np.take_along_axis(a.data, indices, axis=-1)
 
     def bw(g):
-        gb = np.zeros_like(a.data)
+        gb = np.zeros(a.shape, dtype=a.dtype)
         grids = np.indices(indices.shape)
         grids[-1] = indices
         np.add.at(gb, tuple(grids), g)
@@ -776,7 +940,7 @@ def embedding(ids, weight):
     out = weight.data[ids]
 
     def bw(g):
-        gw = np.zeros_like(weight.data)
+        gw = np.zeros(weight.shape, dtype=weight.dtype)
         np.add.at(gw, ids.reshape(-1), g.reshape(-1, weight.shape[-1]))
         return (gw,)
 
@@ -803,7 +967,8 @@ def cumsum(a, axis):
 # ---------------------------------------------------------------------------
 def softmax(a, axis=-1):
     a = _t(a)
-    shifted = a.data - np.max(a.data, axis=axis, keepdims=True)
+    x = a.data
+    shifted = x - np.max(x, axis=axis, keepdims=True)
     e = np.exp(shifted)
     out = e / np.sum(e, axis=axis, keepdims=True)
 
@@ -811,12 +976,13 @@ def softmax(a, axis=-1):
         s = np.sum(g * out, axis=axis, keepdims=True)
         return (out * (g - s),)
 
-    return make_op(out, (a,), bw)
+    return make_op(out, (a,), bw, cache=False)
 
 
 def log_softmax(a, axis=-1):
     a = _t(a)
-    shifted = a.data - np.max(a.data, axis=axis, keepdims=True)
+    x = a.data
+    shifted = x - np.max(x, axis=axis, keepdims=True)
     lse = np.log(np.sum(np.exp(shifted), axis=axis, keepdims=True))
     out = shifted - lse
 
@@ -824,13 +990,13 @@ def log_softmax(a, axis=-1):
         s = np.sum(g, axis=axis, keepdims=True)
         return (g - np.exp(out) * s,)
 
-    return make_op(out, (a,), bw)
+    return make_op(out, (a,), bw, cache=False)
 
 
 def cross_entropy(logits, targets, reduction="mean", ignore_index=-100):
     logits = _t(logits)
     targets = np.asarray(targets, dtype=np.int64)
-    flat_logits = logits.data.reshape(-1, logits.data.shape[-1])
+    flat_logits = logits.data.reshape(-1, logits.shape[-1])
     flat_targets = targets.reshape(-1)
     rows = np.arange(flat_targets.size)
     valid = flat_targets != ignore_index
@@ -838,6 +1004,9 @@ def cross_entropy(logits, targets, reduction="mean", ignore_index=-100):
 
     shifted = flat_logits - np.max(flat_logits, axis=-1, keepdims=True)
     lse = np.log(np.sum(np.exp(shifted), axis=-1))
+    # The fp32 path keeps the original shifted/lse cache.  Under compressed
+    # storage, recompute them in backward from the stored logits instead.
+    cache = (shifted, lse) if _full_precision_storage() else None
     picked = shifted[rows, safe_targets]
     losses = np.where(valid, lse - picked, 0.0).astype(DTYPE)
     denom = max(1, int(valid.sum())) if reduction == "mean" else 1
@@ -851,7 +1020,15 @@ def cross_entropy(logits, targets, reduction="mean", ignore_index=-100):
         raise ValueError(f"unknown reduction {reduction!r}")
 
     def bw(g):
-        probs = np.exp(shifted - lse[:, None])
+        if cache is not None:
+            shifted_now, lse_now = cache
+        else:
+            # Recompute from the (possibly compressed) logits tensor instead
+            # of retaining a second T x V copy in the graph.
+            current = logits.data.reshape(-1, logits.shape[-1])
+            shifted_now = current - np.max(current, axis=-1, keepdims=True)
+            lse_now = np.log(np.sum(np.exp(shifted_now), axis=-1))
+        probs = np.exp(shifted_now - lse_now[:, None])
         probs[rows, safe_targets] -= 1.0
         probs[~valid] = 0.0
         if reduction == "mean":
@@ -862,7 +1039,7 @@ def cross_entropy(logits, targets, reduction="mean", ignore_index=-100):
             probs *= np.asarray(g).reshape(-1, 1)
         return (probs.reshape(logits.shape),)
 
-    return make_op(out, (logits,), bw)
+    return make_op(out, (logits,), bw, cache=False)
 
 
 def mse_loss(a, b, reduction="mean"):
@@ -871,12 +1048,15 @@ def mse_loss(a, b, reduction="mean"):
     sq = diff * diff
     n = diff.size
     out = np.asarray(sq.mean() if reduction == "mean" else sq.sum(), dtype=DTYPE)
+    held_diff = diff if _full_precision_storage() else None
 
     def bw(g):
+        current = held_diff if held_diff is not None else a.data - b.data
         scale = np.asarray(g) * (1.0 / n if reduction == "mean" else 1.0)
-        return (_unbroadcast(2.0 * diff * scale, a.shape), _unbroadcast(-2.0 * diff * scale, b.shape))
+        return (_unbroadcast(2.0 * current * scale, a.shape),
+                _unbroadcast(-2.0 * current * scale, b.shape))
 
-    return make_op(out, (a, b), bw)
+    return make_op(out, (a, b), bw, cache=False)
 
 
 # ---------------------------------------------------------------------------
@@ -934,11 +1114,13 @@ def scan(values, alpha, s0=None):
             dvalues = dvalues[0]
             ds0 = ds0[0]
         if s0 is None:
-            return dvalues, dalpha.astype(alpha.data.dtype)
-        return dvalues, dalpha.astype(alpha.data.dtype), ds0.astype(_t(s0).data.dtype)
+            return dvalues, dalpha.astype(alpha.dtype)
+        return dvalues, dalpha.astype(alpha.dtype), ds0.astype(_t(s0).dtype)
 
     inputs = (values, alpha) if s0 is None else (values, alpha, s0)
-    return make_op(out[0] if one_dim else out, inputs, bw)
+    # The recurrent scan output is also the state history; keep it at the
+    # runtime precision (see PORT_NOTES.md).
+    return make_op(out[0] if one_dim else out, inputs, bw, cache=False)
 
 
 def _scan_backward(grad, states, alpha, s0, chunk):
@@ -1133,7 +1315,7 @@ class Module:
             if set_to_none:
                 param.grad = None
             elif param.grad is not None:
-                param.grad[...] = 0
+                _precision.zero_gradient(param.grad)
 
     def state_dict(self):
         out = {}
@@ -1251,13 +1433,14 @@ def clip_grad_norm_(parameters, max_norm):
     for p in params:
         if p.grad is None:
             continue
-        total_sq += float(np.sum(p.grad.astype(np.float64) ** 2))
+        grad = _precision.gradient_array(p.grad)
+        total_sq += float(np.sum(grad.astype(np.float64) ** 2))
     total = math.sqrt(total_sq)
     if total > max_norm and total > 0:
         scale = max_norm / total
         for p in params:
             if p.grad is not None:
-                p.grad *= scale
+                p.grad = _precision.scale_gradient(p.grad, scale)
     return total
 
 
