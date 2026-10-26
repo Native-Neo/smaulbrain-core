@@ -997,6 +997,27 @@ def index_add_rows(dst, ids, src):
     return make_op(out, (dst, src), bw)
 
 
+def index_add_rows_many(dst, updates):
+    """Accumulate multiple row updates with one destination copy."""
+    dst = _t(dst)
+    parents = [dst]
+    normalized = []
+    out = dst.data.copy()
+    for ids, src in updates:
+        src = _t(src)
+        ids = np.asarray(ids, dtype=np.int64).reshape(-1)
+        if ids.size != src.shape[0] or src.shape[1:] != dst.shape[1:]:
+            raise ValueError("row updates must match destination shape")
+        np.add.at(out, ids, src.data)
+        normalized.append(ids)
+        parents.append(src)
+
+    def bw(g):
+        return (g.copy(), *(g[ids] for ids in normalized))
+
+    return make_op(out, tuple(parents), bw)
+
+
 def embedding(ids, weight):
     weight = _t(weight)
     ids = np.asarray(ids, dtype=np.int64)
