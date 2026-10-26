@@ -343,6 +343,28 @@ def test_model_forward_backward(preset):
     assert opt.n_updates == 1
 
 
+def test_loss_backward_returns_gradient_buffers_without_copying(monkeypatch):
+    spec = cfg.PRESETS["dense-tiny"]
+    m = model.Model(spec, model.build_params(spec, np.random.default_rng(27)))
+    original_zero_grad = m.zero_grad
+    captured = {}
+
+    def capture_before_clear(*args, **kwargs):
+        current = {k: v.grad for k, v in m.p.items() if v.grad is not None}
+        if current:
+            captured.update(current)
+        return original_zero_grad(*args, **kwargs)
+
+    monkeypatch.setattr(m, "zero_grad", capture_before_clear)
+    loss, grads, _ = m.loss_and_backward(
+        np.random.default_rng(28).integers(0, 256, 8).tolist())
+    assert np.isfinite(loss)
+    assert grads and grads.keys() == captured.keys()
+    assert all(grads[name] is captured[name] for name in grads)
+    assert all(parameter.grad is None for parameter in m.p.values())
+    assert all(np.isfinite(grad).all() for grad in grads.values())
+
+
 def test_ternary_training_prefetches_invalidated_weights():
     spec = cfg.PRESETS["dense-tiny"]
     m = model.Model(spec, model.build_params(spec, np.random.default_rng(93)),
