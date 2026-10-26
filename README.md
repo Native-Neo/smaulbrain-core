@@ -161,14 +161,24 @@ it transparently falls back to a NumPy decode-and-multiply path. FP8 is
 software-emulated on CPU.
 
 Packed ternary is faster for complete training steps on the dense workload.
-On `dense-tiny` at sequence 512, with optimizer updates and re-packing included,
-the measured step was 146.1 ms versus 197.6 ms for FP32 (1.35x); forward was
-70.8 ms versus 127.8 ms (1.81x). Backward was 65.6 ms versus 60.9 ms because
-the straight-through weight gradient remains an FP32 GEMM even though the
-input gradient comes from packed weights. At sequence 64 the step is about
-1.12x faster. See
+In the clean-load run on `dense-tiny` at sequence 512, with optimizer updates
+and re-packing included, the measured step was 146.1 ms versus 197.6 ms for
+FP32 (1.35x); forward was 70.8 ms versus 127.8 ms (1.81x). Backward was
+65.6 ms versus 60.9 ms because the straight-through weight gradient remains an
+FP32 GEMM even though the input gradient comes from packed weights. At
+sequence 64 the step was about 1.12x faster. A later re-run with a concurrent
+Java workload on the host still measured 1.28x at sequence 512 but only parity
+at sequence 64; the contention penalizes the native worker pool more than
+OpenBLAS. The benchmark drives the production `Model` / `npgrad` /
+`SmaulOPT` path; only the kernel A/B table uses direct C calls.
+
+Re-packing after an optimizer step now uses one batched native call and
+views into a single packed allocation, halving the packing cost. SiLU also
+runs its sigmoid ufuncs in place with bitwise-identical full-precision results,
+saving roughly 8 ms per sequence-512 forward. See
 [`benchmarks/TERNARY_RESULTS.md`](benchmarks/TERNARY_RESULTS.md) for the frozen
-pure-compute comparison, kernel A/B numbers, and reproduction commands:
+pure-compute comparison, kernel A/B numbers, STE weight-gradient investigation,
+full-step profile, and reproduction commands:
 
 ```bash
 python benchmarks/ternary_benchmark.py --steps 15 --warmup 3 --runs 3 \
