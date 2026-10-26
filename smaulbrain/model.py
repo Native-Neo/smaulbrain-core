@@ -455,8 +455,13 @@ class Model:
             finally:
                 if self.store is not None:
                     self.store.unpin(eid)
-        if updates:
-            Y = ng.index_add_rows_many(Y, updates)
+        if self.activation_storage == "fp32":
+            if updates:
+                Y = ng.index_add_rows_many(Y, updates)
+        else:
+            # Preserve per-expert storage rounding in BF16/INT8 modes.
+            for rows, contribution in updates:
+                Y = ng.index_add_rows(Y, rows, contribution)
         return Y, info
 
     @staticmethod
