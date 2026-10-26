@@ -772,7 +772,7 @@ extern "C" int smaulbrain_tiled_matmat(
     // so batch blocks can run concurrently while each tile keeps its packed
     // weight bytes hot in cache. Small per-tile work often misses the old
     // one-million-MAC cutoff even though the whole call benefits from threads.
-    constexpr std::size_t kBatchBlock = 64;
+    constexpr std::size_t kBatchBlock = 512;
     const std::size_t nblocks = (batch + kBatchBlock - 1) / kBatchBlock;
     const std::size_t nitems = ntiles * nblocks;
 #if defined(__AVX__)
@@ -841,7 +841,7 @@ extern "C" int smaulbrain_tiled_transpose_matmat(
     // to spread across the pool. The 32-row blocks win for wide outputs where
     // dy is the larger stream; 64 rows use less weight-decode work for the
     // narrow-output shapes.
-    const std::size_t bblock = (din <= 32 && dout > 32) ? 32 : 64;
+    const std::size_t bblock = (din <= 32 && dout <= 32) ? 64 : 32;
     constexpr std::size_t kRows = 64;
     const std::size_t n_i = (din + kRows - 1) / kRows;
     const std::size_t n_b = (batch + bblock - 1) / bblock;
