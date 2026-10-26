@@ -11,99 +11,83 @@ be compiled. The benchmark imports and drives the production `Model`,
 `npgrad`, and `SmaulOPT` path, including the training-loop invalidation order;
 only the kernel-only A/B table below calls the C entry points directly.
 
-> **Revision note.** The clean-load end-to-end tables below are the original
-> packed-kernel run (load average 1.9-2.2). Since then the cached packing path
-> was batched and SiLU stopped allocating full-size temporaries; both changes
-> are measured in their own sections. A fresh end-to-end run was taken with a
-> concurrent Java workload on the host (load average 2.8-4.9), so its absolute
-> times are inflated and are reported only as a directional check. Those
-> reruns are stored as `*_loaded.json` and `ternary_phase_results.json`. They
-> predate the final removal of a redundant single-matrix copy; that cleanup
-> only lowers packing cost. The component A/B measurements are the useful
-> result for this revision.
+> **Revision note.** The end-to-end tables below are a fresh low-load rerun
+> of the current checkout after the concurrent Java workload stopped. The
+> earlier pre-change baseline remains in git history; runs taken while Java
+> was active are retained as `*_loaded.json` but are excluded from the
+> comparison because contention distorts the native/OpenBLAS balance. The
+> component A/B sections use the same current code unless stated otherwise.
 
 ## Summary
 
-On the dense-tiny model at sequence 512, in the clean-load run with 15
-measured steps after three warm-up steps and three mode-order-rotated runs:
+Latest low-load rerun of the current checkout, after the concurrent Java
+workload stopped (15 steps, three warm-ups, three mode-rotated runs, 1-minute
+load average 1.26-1.73; a browser still shared the CPU):
 
-- **Forward:** 127.8 ms FP32 vs 70.8 ms ternary. Ternary forward is **1.81x
+- **Forward:** 142.8 ms FP32 vs 83.3 ms ternary. Ternary forward is **1.72x
   faster**.
-- **Backward:** 60.9 ms FP32 vs 65.6 ms ternary. The packed input-gradient
+- **Backward:** 73.6 ms FP32 vs 84.4 ms ternary. The packed input-gradient
   kernel is offset by the unchanged FP32 straight-through weight GEMM, so
-  backward is **7.7% slower**.
-- **Full optimizer step:** 197.6 ms FP32 vs 146.1 ms ternary. Including the
-  optimizer, gradient extraction, and invalidation/re-packing of changed
-  ternary weights, the step is **1.35x faster**.
+  backward is **0.87x**.
+- **Full optimizer step:** 229.0 ms FP32 vs 181.8 ms ternary. Including the
+  optimizer, gradient extraction, and invalidation/re-packing, the step is
+  **1.26x faster**.
 
-At sequence 64, forward is 1.23x faster, backward is 1.02x faster, and the
-full step is 1.12x faster. The fixed cost of re-packing every changed weight
-is a larger fraction of the shorter step.
+At sequence 64, forward is 1.25x faster, backward is 0.93x, and the full step
+is 1.03x faster. The fixed step overhead and optimizer dominate the shorter
+sequence.
 
 With weights frozen after warm-up (pure forward/backward arithmetic and a warm
-packed cache), sequence 512 measures 1.86x faster forward, 0.95x backward, and
-1.40x for the complete step. Sequence 64 measures 1.34x, 0.91x, and 1.08x
-respectively.
+packed cache), sequence 512 measures 1.71x faster forward, 0.90x backward, and
+1.32x for the complete step. Sequence 64 measures 1.27x, 0.85x, and 1.04x.
+These frozen numbers use the same host state as the training table.
 
-**Interpretation:** ternary is faster than FP32 for complete training steps on
-the measured dense workload, driven by a substantially faster forward. The
+**Interpretation:** ternary is faster for complete training steps on the
+measured dense workload, driven by a substantially faster forward. The
 remaining backward cost is the STE weight gradient, which is a normal FP32
-GEMM in both modes; packed storage cannot accelerate it. The clean-load
-numbers are conservative for this revision because both batching and in-place
-SiLU reduce the ternary and FP32 forward paths further.
+GEMM in both modes; packed storage cannot accelerate it. Training-step absolute
+times are roughly 10-25% slower than the earlier clean-load baseline in git
+history even though the load average is lower, so compare configurations
+within one host state rather than across sessions.
 
 ## Measured model timings
 
 `benchmarks/ternary_benchmark.py`, `dense-tiny`, 15 steps, 3 warm-ups, median
 of 3 runs with mode order rotated between runs. Training mode runs the
 optimizer and invalidates the packed cache before each next step; frozen mode
-skips both. These are the original clean-load measurements; see the current
-loaded-host check below.
+skips both.
 
-### Clean-load training step (includes optimizer and re-packing)
-
-| sequence | mode | forward | backward | step | forward speedup | backward speedup | step speedup |
-|---:|---|---:|---:|---:|---:|---:|---:|
-| 64 | FP32 | 24.7 ms | 21.5 ms | 56.7 ms | 1.00x | 1.00x | 1.00x |
-| 64 | ternary | 20.1 ms | 21.1 ms | 50.5 ms | 1.23x | 1.02x | 1.12x |
-| 512 | FP32 | 127.8 ms | 60.9 ms | 197.6 ms | 1.00x | 1.00x | 1.00x |
-| 512 | ternary | 70.8 ms | 65.6 ms | 146.1 ms | 1.81x | 0.93x | 1.35x |
-
-### Clean-load frozen weights (pure forward/backward, warm cache)
+### Training step (includes optimizer and re-packing)
 
 | sequence | mode | forward | backward | step | forward speedup | backward speedup | step speedup |
 |---:|---|---:|---:|---:|---:|---:|---:|
-| 64 | FP32 | 25.5 ms | 21.6 ms | 49.5 ms | 1.00x | 1.00x | 1.00x |
-| 64 | ternary | 19.1 ms | 23.6 ms | 45.9 ms | 1.34x | 0.91x | 1.08x |
-| 512 | FP32 | 145.1 ms | 74.9 ms | 221.8 ms | 1.00x | 1.00x | 1.00x |
-| 512 | ternary | 77.9 ms | 79.1 ms | 158.6 ms | 1.86x | 0.95x | 1.40x |
+| 64 | FP32 | 27.1 ms | 22.6 ms | 60.1 ms | 1.00x | 1.00x | 1.00x |
+| 64 | ternary | 21.8 ms | 24.4 ms | 58.1 ms | 1.25x | 0.93x | 1.03x |
+| 512 | FP32 | 142.8 ms | 73.6 ms | 229.0 ms | 1.00x | 1.00x | 1.00x |
+| 512 | ternary | 83.3 ms | 84.4 ms | 181.8 ms | 1.72x | 0.87x | 1.26x |
+
+### Frozen weights (pure forward/backward, warm cache)
+
+| sequence | mode | forward | backward | step | forward speedup | backward speedup | step speedup |
+|---:|---|---:|---:|---:|---:|---:|---:|
+| 64 | FP32 | 27.4 ms | 22.5 ms | 52.0 ms | 1.00x | 1.00x | 1.00x |
+| 64 | ternary | 21.5 ms | 26.6 ms | 49.9 ms | 1.27x | 0.85x | 1.04x |
+| 512 | FP32 | 140.1 ms | 75.6 ms | 220.5 ms | 1.00x | 1.00x | 1.00x |
+| 512 | ternary | 82.0 ms | 84.2 ms | 166.8 ms | 1.71x | 0.90x | 1.32x |
 
 The `step` column also includes copying gradients out of the graph and, in
 training mode, the optimizer and cache invalidation. The profiled
 `forward`/`backward` columns are the model's own phase timers.
 
-### Current loaded-host check
+### Host-load sensitivity
 
-The same training command was repeated after the batching and in-place SiLU
-changes, while a Java workload was using the host (recorded load average 4.17
-/ 3.61 / 2.80). Absolute times are much larger than the clean-load run, so the
-two tables must not be compared row by row.
-
-| sequence | mode | forward | backward | step | forward speedup | backward speedup | step speedup |
-|---:|---|---:|---:|---:|---:|---:|---:|
-| 64 | FP32 | 33.7 ms | 31.3 ms | 79.1 ms | 1.00x | 1.00x | 1.00x |
-| 64 | ternary | 30.6 ms | 35.9 ms | 79.7 ms | 1.10x | 0.87x | 0.99x |
-| 512 | FP32 | 187.8 ms | 116.3 ms | 320.5 ms | 1.00x | 1.00x | 1.00x |
-| 512 | ternary | 113.3 ms | 128.0 ms | 251.2 ms | 1.66x | 0.91x | 1.28x |
-
-The current frozen run (load 4.86 / 3.77 / 2.99) measured 1.11x / 0.87x /
-1.00x at sequence 64 and 1.52x / 0.86x / 1.20x at sequence 512 for
-forward/backward/step. The contention penalizes the native worker pool more
-than OpenBLAS, which is why the short-sequence step ratio falls to parity.
-The component A/B measurements below isolate the actual code changes. These
-two training/frozen reruns are in
+Earlier runs with a concurrent Java workload are retained as
 [`ternary_results_loaded.json`](ternary_results_loaded.json) and
 [`ternary_results_frozen_loaded.json`](ternary_results_frozen_loaded.json).
+They are not used for the summary or comparison tables because the native
+worker pool is penalized more than OpenBLAS under contention. The current
+clean runs are [`ternary_results.json`](ternary_results.json) and
+[`ternary_results_frozen.json`](ternary_results_frozen.json).
 
 ## Packed-kernel changes
 
@@ -159,32 +143,32 @@ instead of silently serving stale weights. Tests cover batch/individual byte
 parity, cache invalidation, prefetch parity, expert exclusion, and the actual
 ternary training path.
 
-Direct pack of the 105 dense-tiny matrices (CPU time, representative median
-of 30 calls; repeated runs varied by about 0.2 ms):
+Direct pack of the 105 dense-tiny matrices (CPU time, median of 30 calls):
 
 | variant | median | minimum |
 |---|---:|---:|
-| per-matrix calls | 2.24 ms | 1.99 ms |
-| batched native call | 1.17 ms | 0.91 ms |
+| per-matrix calls | 2.05 ms | 1.94 ms |
+| batched native call | 0.94 ms | 0.88 ms |
 
 The single-matrix path also no longer copies the freshly packed buffer, so
-even lazy expert packing dropped from roughly 2.9 ms to 2.2-2.6 ms for this
-set. The end-to-end effect is smaller because forward work dominates. In a
-same-process A/B of cold forwards after invalidation (12 alternating pairs,
-sequence 512), lazy packing took 156.9 ms median versus 153.8 ms with
-prefetch. The two paths are logically identical; the difference is the ~1.5 ms
-of packing and wrapper work.
+its measured cost is now about 2.0 ms for this set. The end-to-end effect is
+smaller because forward work dominates. In a same-process A/B of cold forwards
+after invalidation (12 alternating pairs, sequence 512), lazy packing took
+82.75 ms median versus 79.24 ms with prefetch. The two paths are logically
+identical; the difference is the packing and wrapper work.
 
-Phase instrumentation from the loaded current run:
+Phase instrumentation from the clean current run:
 
 | sequence | forward | of which pack | cache lookup + prefetch | optimizer | invalidation | step |
 |---:|---:|---:|---:|---:|---:|---:|
-| 64 | 35.02 ms | 2.06 ms | 2.43 ms | 11.84 ms | 0.21 ms | 88.54 ms |
-| 512 | 125.19 ms | 1.59 ms | 2.09 ms | 11.45 ms | 0.18 ms | 272.20 ms |
+| 64 | 22.58 ms | 1.28 ms | 1.55 ms | 9.48 ms | 0.13 ms | 59.37 ms |
+| 512 | 83.09 ms | 1.23 ms | 1.49 ms | 8.58 ms | 0.14 ms | 174.93 ms |
 
-The earlier phase run measured 3.35 ms of packing at sequence 64 and
-3.9-4.4 ms at sequence 512, at lower background load. Compare the direct CPU
-A/B above, not those absolute values.
+These are clean runs under the same host state as the summary; the phase and
+main runs are separate, so compare component shares rather than the step
+totals. The profile wrapper adds a small overhead. Earlier instrumented runs
+measured 3.35 ms of packing at sequence 64 and 3.9-4.4 ms at sequence 512;
+compare the direct CPU A/B above rather than those older absolute values.
 
 ## In-place SiLU
 
@@ -197,33 +181,33 @@ Full-precision results are bitwise identical; tests compare fp32, bf16, and
 int8 storage paths against the allocating formula.
 
 On a representative FFN activation (`512x128`, fp32 activation storage,
-median of 100 calls):
+median of 200 calls across two alternating rounds):
 
 | version | time |
 |---|---:|
-| allocating | 3.52 ms |
-| in-place | 2.95 ms |
+| allocating | 2.23-2.42 ms |
+| in-place | 2.06-2.08 ms |
 
-That is a 1.19x improvement, or roughly 8 ms per sequence-512 forward across
-15 FFN blocks. The profile below still lists SiLU first because the remaining
-cost is the `exp` and elementwise work itself, not allocation.
+That is a 1.07-1.18x improvement, or roughly 2-5 ms per sequence-512 forward
+across 15 FFN blocks. The profile below still lists SiLU first because the
+remaining cost is the `exp` and elementwise work itself, not allocation.
 
 ## Why the STE weight gradient still uses OpenBLAS
 
 A temporary AVX1 outer-product kernel was implemented and measured against
 `x.T @ dy` with preallocated outputs. It was correct (maximum relative error
 about 6e-4 versus BLAS, from summation order) but lost on the training shape.
-Batch 512, two native threads, median of repeated runs:
+Batch 512, two native threads, best of repeated medians:
 
 | dW shape | OpenBLAS | native prototype | result |
 |---|---:|---:|---|
-| 32x32 | 49.5 us | 58.6 us | BLAS 1.18x faster |
-| 32x128 | 133.0 us | 234.6 us | BLAS 1.76x faster |
-| 128x32 | 142.5 us | 214.7 us | BLAS 1.51x faster |
+| 32x32 | 30.2 us | 35.7 us | BLAS 1.18x faster |
+| 32x128 | 74.4 us | 132.0 us | BLAS 1.77x faster |
+| 128x32 | 76.9 us | 129.3 us | BLAS 1.68x faster |
 
-At batch 64 the prototype reached parity only for 128x32 (38.3 us versus
-39.9 us); the saving would be about 0.02 ms per step, so a second code path is
-not justified. Transposing the operands (`(dy.T @ x).T`) and contiguous-copy
+At batch 64 the native prototype was still slower on every shape (native vs
+OpenBLAS: 12.7 vs 8.6 us, 22.4 vs 20.8 us, and 22.9 vs 20.9 us), so there was
+no saving to recover. Transposing the operands (`(dy.T @ x).T`) and contiguous-copy
 variants were also slower. Concatenating the attention and FFN weight
 gradients into one GEMM lost the benefit to the copy/concatenation overhead
 (122.9 us fused versus 93.2 us separate for attention; 217.8 us versus
@@ -236,19 +220,20 @@ unimplemented optimization.
 ## Full-model profile
 
 A cProfile run of one ternary training step at sequence 512 (current code,
-loaded host) recorded 281 ms of profiled time; cProfile inflates Python work,
-so use the phase table for step accounting. Selected cumulative/tottime:
+low-load host, 1-minute load about 1.3) recorded 193 ms of profiled time;
+cProfile inflates Python work, so use the phase table for step accounting.
+Selected cumulative/tottime:
 
 | component | time | share / note |
 |---|---:|---|
-| SiLU (15 calls) | 43 ms cumulative | largest activation cost |
-| packed forward + dX (210 calls) | 48 ms cumulative | NCM matrix work |
-| recurrent scans (forward + backward) | 40 ms cumulative | chunked closed-form scan |
-| STE dW (105 calls) | 16 ms tottime | FP32 OpenBLAS floor |
-| RMSNorm (31 calls) | 14 ms cumulative | about 5% |
-| native optimizer | 13 ms cumulative | about 5% |
-| sigmoid (15 calls) | 10 ms cumulative | attention gate |
-| batched pack | about 2 ms | after this revision |
+| SiLU (15 calls) | 29 ms cumulative | largest activation cost |
+| packed forward + dX (210 calls) | 27 ms cumulative | NCM matrix work |
+| recurrent scans (forward + backward) | 32 ms cumulative | chunked closed-form scan |
+| STE dW (105 calls) | 10 ms tottime | FP32 OpenBLAS floor |
+| RMSNorm (31 calls) | 10 ms cumulative | about 5% |
+| native optimizer | 10 ms cumulative | about 5% |
+| sigmoid (15 calls) | 8 ms cumulative | attention gate |
+| batched pack | 1-1.3 ms | after this revision |
 
 There is no MoE routing in `dense-tiny`, so routing is not represented in this
 table. The NCM-specific work is the packed matmul pair; it is already the
@@ -308,9 +293,10 @@ and [`ternary_phase_results.json`](ternary_phase_results.json).
   or hardware FMA. The host CPU reports `fma` in `/proc/cpuinfo` but faults on
   an actual FMA instruction, so the build deliberately uses
   `-ffp-contract=off` and no FMA.
-- Absolute times move with background load and CPU frequency. The clean-load
-  tables were recorded at load average 1.9-2.2; the current check and phase run
-  were recorded at 2.8-4.9 while a Java workload shared the four logical CPUs.
+- Absolute times move with background load and CPU frequency. The current
+  tables were recorded at 1-minute load average 1.26-1.73 with a browser
+  sharing the four logical CPUs; runs taken during a Java workload are retained
+  separately.
   The ratio between configurations is more stable than the absolute numbers,
   but the native pool is penalized more than OpenBLAS under contention.
 - Dense FP32 backward is a highly optimized OpenBLAS GEMM. Ternary dX is
