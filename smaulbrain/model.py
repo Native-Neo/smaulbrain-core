@@ -458,10 +458,9 @@ class Model:
 
     @staticmethod
     def _rmsnorm(X, gain):
-        # Normalization statistics stay at full precision even when activation
-        # storage is reduced.
-        with _precision.activation_storage("fp32"):
-            return X * ng.rsqrt(X.square().mean(dim=-1, keepdim=True) + _ops.EPS) * gain
+        # The fused op computes the statistics and update in float32 and keeps
+        # its result uncompressed, as the previous explicit graph did.
+        return ng.rmsnorm(X, gain, _ops.EPS)
 
     def _mtp_module(self, k, H, tok_in, state=None):
         p = self.p
