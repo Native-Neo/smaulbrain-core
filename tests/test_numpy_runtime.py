@@ -39,6 +39,31 @@ def test_scan_matches_explicit_recurrence():
     np.testing.assert_allclose(got, np.stack(rows, axis=1), rtol=1e-5, atol=1e-6)
 
 
+@pytest.mark.parametrize("shape,batch", [
+    ((32, 32), 512),
+    ((32, 128), 512),
+    ((128, 32), 512),
+    ((7, 33), 65),
+])
+def test_tiled_packed_parallel_blocks_match_reference(shape, batch):
+    """Batch/row work partitioning must not change packed matmul results."""
+    if not quant.prepare_ternary_backend():
+        pytest.skip("native C++ ternary backend is unavailable")
+    din, dout = shape
+    rng = np.random.default_rng(din * 1000 + dout + batch)
+    W = (rng.standard_normal(shape) * 0.3).astype(np.float32)
+    packed, scale, packed_shape, _ = quant.pack_ternary_tiled(W)
+    dense = quant.unpack_ternary(packed, packed_shape, scale)
+    X = rng.standard_normal((batch, din)).astype(np.float32)
+    dY = rng.standard_normal((batch, dout)).astype(np.float32)
+    np.testing.assert_allclose(
+        quant.packed_matmat(X, packed, packed_shape, scale),
+        X @ dense, rtol=2e-5, atol=2e-5)
+    np.testing.assert_allclose(
+        quant.packed_matmat_transpose(dY, packed, packed_shape, scale),
+        dY @ dense.T, rtol=2e-5, atol=2e-5)
+
+
 def test_safetensors_and_quant_roundtrip(tmp_path):
     arrays = {
         "f32": np.arange(6, dtype=np.float32).reshape(2, 3),
