@@ -57,6 +57,7 @@ class SmaulOPT:
         omb1 = 1.0 - b1
         omb2 = 1.0 - b2
         wd = 1.0 - self.lr * self.weight_decay if self.weight_decay else None
+        factored = []
         for name, value in params.items():
             w = value.data if isinstance(value, Tensor) else value
             g = grads.get(name)
@@ -67,34 +68,58 @@ class SmaulOPT:
                 self._init_state(name, w)
             st = self.state[name]
             if st["factored"]:
-                native = _native_opt.factored_step(self, w, g, st, collect_norms)
-                if native is not None:
-                    if collect_norms:
-                        norms[name] = native
-                    continue
+                # Defer matrix updates so the native backend can consume the
+                # whole list with one FFI crossing. Validation is all-or-none
+                # before the call, so the fallback below cannot apply twice.
+                factored.append((name, w, g, st))
+                continue
             if wd is not None:
                 w *= wd
             st["m"] *= b1
             st["m"] += omb1 * g
             g2 = g * g
-            if st["factored"]:
-                st["R"] *= b2
-                st["R"] += omb2 * g2.mean(axis=1)
-                st["C"] *= b2
-                st["C"] += omb2 * g2.mean(axis=0)
-                del g2
-                denom_r = max(float(st["R"].mean()), 1e-30)
-                vhat = (st["R"][:, None] * st["C"][None, :]) / denom_r
-                np.maximum(vhat, 0.0, out=vhat)
-            else:
-                st["v"] *= b2
-                st["v"] += omb2 * g2
-                del g2
-                vhat = np.maximum(st["v"], 0.0)
+            st["v"] *= b2
+            st["v"] += omb2 * g2
+            del g2
+            vhat = np.maximum(st["v"], 0.0)
             upd = st["m"] / (np.sqrt(vhat, out=vhat) + eps)
             if collect_norms:
                 norms[name] = float(np.sqrt(np.mean(upd * upd, dtype=np.float64)))
             w -= self.lr * upd
+
+        if factored:
+            native = _native_opt.factored_step_many(
+                self, factored, collect_norms) if _native_opt is not None else None
+            if native is not None:
+                if collect_norms:
+                    for (name, _w, _g, _st), norm in zip(factored, native):
+                        norms[name] = norm
+            else:
+                for name, w, g, st in factored:
+                    native_one = _native_opt.factored_step(
+                        self, w, g, st, collect_norms)
+                    if native_one is not None:
+                        if collect_norms:
+                            norms[name] = native_one
+                        continue
+                    if wd is not None:
+                        w *= wd
+                    st["m"] *= b1
+                    st["m"] += omb1 * g
+                    g2 = g * g
+                    st["R"] *= b2
+                    st["R"] += omb2 * g2.mean(axis=1)
+                    st["C"] *= b2
+                    st["C"] += omb2 * g2.mean(axis=0)
+                    del g2
+                    denom_r = max(float(st["R"].mean()), 1e-30)
+                    vhat = (st["R"][:, None] * st["C"][None, :]) / denom_r
+                    np.maximum(vhat, 0.0, out=vhat)
+                    upd = st["m"] / (np.sqrt(vhat, out=vhat) + eps)
+                    if collect_norms:
+                        norms[name] = float(np.sqrt(
+                            np.mean(upd * upd, dtype=np.float64)))
+                    w -= self.lr * upd
         self.n_updates += 1
         return norms
 
