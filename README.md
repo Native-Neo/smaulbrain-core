@@ -161,21 +161,21 @@ it transparently falls back to a NumPy decode-and-multiply path. FP8 is
 software-emulated on CPU.
 
 Packed ternary is faster for complete training steps on the dense workload.
-In the clean-load run on `dense-tiny` at sequence 512, with optimizer updates
-and re-packing included, the measured step was 146.1 ms versus 197.6 ms for
-FP32 (1.35x); forward was 70.8 ms versus 127.8 ms (1.81x). Backward was
-65.6 ms versus 60.9 ms because the straight-through weight gradient remains an
-FP32 GEMM even though the input gradient comes from packed weights. At
-sequence 64 the step was about 1.12x faster. A later re-run with a concurrent
-Java workload on the host still measured 1.28x at sequence 512 but only parity
-at sequence 64; the contention penalizes the native worker pool more than
-OpenBLAS. The benchmark drives the production `Model` / `npgrad` /
+In the latest low-load run on `dense-tiny` at sequence 512, with optimizer
+updates and re-packing included, the measured step was 181.8 ms versus
+229.0 ms for FP32 (1.26x); forward was 83.3 ms versus 142.8 ms (1.72x).
+Backward was 84.4 ms versus 73.6 ms because the straight-through weight
+gradient remains an FP32 GEMM even though the input gradient comes from packed
+weights. At sequence 64 the step was about 1.03x faster. Absolute times vary
+with host state, so use the within-run ratios; an earlier baseline is retained
+in git history. The benchmark drives the production `Model` / `npgrad` /
 `SmaulOPT` path; only the kernel A/B table uses direct C calls.
 
-Re-packing after an optimizer step now uses one batched native call and
-views into a single packed allocation, halving the packing cost. SiLU also
-runs its sigmoid ufuncs in place with bitwise-identical full-precision results,
-saving roughly 8 ms per sequence-512 forward. See
+Re-packing after an optimizer step now uses one batched native call and views
+into a single packed allocation, reducing the pack of 105 dense-tiny matrices
+from about 2.0 ms to 0.9 ms. SiLU also runs its sigmoid ufuncs in place with
+bitwise-identical full-precision results, saving roughly 2-5 ms per
+sequence-512 forward. See
 [`benchmarks/TERNARY_RESULTS.md`](benchmarks/TERNARY_RESULTS.md) for the frozen
 pure-compute comparison, kernel A/B numbers, STE weight-gradient investigation,
 full-step profile, and reproduction commands:
