@@ -3,6 +3,7 @@ import json
 import os
 import shutil
 import tempfile
+import time
 
 import numpy as np
 
@@ -13,6 +14,68 @@ from smaulbrain import CHECKPOINT_VERSION
 
 LEGACY_VERSION = "smaulbrain-v2:1"
 LEGACY_TORCH_VERSION = "smaulbrain-pytorch-v1:1"
+
+_CKPT_TMP_PREFIX = ".ckpt."
+_CKPT_STALE_SECONDS = 60.0
+
+
+def sweep_stale_checkpoints(target_dir, grace=None):
+    """Remove publication debris left around ``target_dir``.
+
+    A trainer killed mid-save can leave ``<parent>/.ckpt.*`` build trees from
+    before the atomic publish and a ``<target>.bak`` tree from the
+    old-target rename.  A later save sweeps them so interrupted runs do not
+    accumulate debris.  Entries newer than ``grace`` seconds (default 60)
+    are never touched, which protects a concurrent writer's fresh temporary.
+    A ``.bak`` tree is always kept while the target checkpoint has no
+    manifest of its own: in the crash-mid-publish state that fallback tree
+    may be the only complete checkpoint on disk, and
+    ``_resolve_checkpoint_dir`` must still be able to find it.  It becomes
+    debris the moment the target is valid again, exactly like the tree the
+    normal publish path deletes after a successful rename.
+
+    Returns the list of removed paths.
+    """
+    grace = _CKPT_STALE_SECONDS if grace is None else float(grace)
+    target_dir = os.path.abspath(target_dir)
+    parent = os.path.dirname(target_dir)
+    now = time.time()
+    removed = []
+    try:
+        entries = os.listdir(parent)
+    except OSError:
+        return removed
+    for name in entries:
+        if not name.startswith(_CKPT_TMP_PREFIX):
+            continue
+        path = os.path.join(parent, name)
+        if os.path.islink(path) or not os.path.isdir(path):
+            continue
+        try:
+            cold = now - os.path.getmtime(path) >= grace
+        except OSError:
+            cold = False
+        if cold:
+            shutil.rmtree(path, ignore_errors=True)
+            if not os.path.exists(path):
+                removed.append(path)
+    bak = target_dir + ".bak"
+    if os.path.isdir(bak) and not os.path.islink(bak):
+        have_target = os.path.isfile(os.path.join(target_dir, "manifest.json"))
+        bak_manifest = os.path.isfile(os.path.join(bak, "manifest.json"))
+        try:
+            cold = now - os.path.getmtime(bak) >= grace
+        except OSError:
+            cold = False
+        # Reap a bak once the new target stands on its own, or once a
+        # manifest-less bak is cold enough not to belong to an in-flight
+        # publisher.  A bak without a valid target is kept unconditionally.
+        if have_target or (not bak_manifest and cold):
+            shutil.rmtree(bak, ignore_errors=True)
+            if not os.path.exists(bak):
+                removed.append(bak)
+    return removed
+
 
 
 def _sha256(path):
@@ -71,7 +134,8 @@ def _flatten(prefix, obj, out):
 def _write_tree(target_dir, manifest, params, opt_state):
     parent = os.path.dirname(os.path.abspath(target_dir))
     os.makedirs(parent, exist_ok=True)
-    tmp = tempfile.mkdtemp(prefix=".ckpt.", dir=parent)
+    sweep_stale_checkpoints(target_dir)
+    tmp = tempfile.mkdtemp(prefix=_CKPT_TMP_PREFIX, dir=parent)
     try:
         pp = os.path.join(tmp, "params.safetensors")
         op = os.path.join(tmp, "optim.safetensors")
