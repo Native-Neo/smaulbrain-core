@@ -116,55 +116,23 @@ def _rmsnorm(x, gain):
     return x * inv * np.asarray(gain, dtype=np.float32)
 
 
-def _scan_chunk_size(alpha):
-    amin = float(np.min(alpha)) if np.size(alpha) else 1.0
-    amin = max(amin, 1e-12)
-    exponent = -math.log(amin)
-    if exponent <= 1e-6:
-        return 128
-    return max(1, min(128, int(60.0 / exponent)))
-
-
 def _scan(values, alpha):
     """s_t = alpha * s_{t-1} + values_t for every position.
 
-    Mirrors the active ``npgrad`` scan implementation and accepts leading draw
-    axes, so a population of independent sequences can be evaluated together.
-    The single-sequence path shares the native sequential kernel with the
-    autograd runtime, keeping Dust's clean forward on the same scan path as
-    ``Model._forward_impl`` when that backend is available.
+    One shared implementation with the autograd runtime: this delegates to
+    ``npgrad.scan``, which runs the native sequential kernel for
+    single-sequence inputs, the chunked closed form for draw populations on
+    leading axes, and an exact sequential recurrence whenever an alpha
+    channel is non-finite or below the fp32 power range.  Dust feeds plain
+    arrays, which are converted without grad tracking, so the call stays a
+    pure forward computation.
     """
     v = np.asarray(values, dtype=np.float32)
     a = np.asarray(alpha, dtype=np.float32)
-    one_dim = v.ndim == 2
-    if (one_dim and v.flags.c_contiguous and a.flags.c_contiguous
-            and v.shape[1] == a.shape[0]):
-        from . import _quant_native as _qn
-        if _qn._NATIVE_LIB is None:
-            _qn.prepare_ternary_backend()
-        if _qn._NATIVE_LIB is not None:
-            states = np.empty_like(v)
-            state = np.zeros(v.shape[1], dtype=np.float32)
-            if _qn.recurrent_scan(v, a, state, states):
-                return states
-    if one_dim:
-        v = v[None, :, :]
-    lead = v.shape[:-2]
-    T, D = v.shape[-2], v.shape[-1]
-    chunk = _scan_chunk_size(a)
-    state = np.zeros(lead + (D,), dtype=np.float32)
-    out = np.empty_like(v)
-    for start in range(0, T, chunk):
-        end = min(start + chunk, T)
-        L = end - start
-        steps = np.arange(1, L + 1, dtype=np.float32).reshape((1,) * len(lead) + (L, 1))
-        powers = np.power(a.reshape((1,) * len(lead) + (1, D)), steps)
-        chunk_vals = v[..., start:end, :]
-        prefix = np.cumsum(chunk_vals / powers, axis=-2)
-        scanned = prefix * powers + powers * state[..., None, :]
-        out[..., start:end, :] = scanned
-        state = scanned[..., -1, :].copy()
-    return out[0] if one_dim else out
+    if np.size(v) == 0:
+        return v
+    from . import npgrad as ng
+    return ng.scan(v, a).data
 
 
 def per_token_cross_entropy(logits, targets):
