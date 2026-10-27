@@ -7,33 +7,32 @@ reference path always remains available.
 import errno
 import os
 import sys
+import hashlib
+import shutil
 from functools import lru_cache
+from pathlib import Path
 
 from .. import cpu as _cpu
 
 _SO_NAME = "smaul_kernels"
 
 
-def build_here(build_dir="", verbose: bool = True) -> str:
-    """Compile the optional native C++ kernels to a loadable shared library."""
-    import hashlib
-    import shutil
-    import subprocess
-    import tempfile
-    from pathlib import Path
+def _digest_and_target(caps):
+    """(compiler, flags, source, target path) for the current source, or None.
 
+    The digest over the current ``cpu_kernels.cpp`` bytes plus the compiler
+    string and flag set defines the canonical library name. Sharing the
+    formula between build and load prevents a stale differently-named build
+    from shadowing the fresh one.
+    """
     here = Path(__file__).resolve().parent
     source = here / "cpu_kernels.cpp"
     if not source.is_file():
-        raise RuntimeError(f"native kernel source missing: {source}")
+        return None
     configured = os.environ.get("CXX", "c++")
     compiler = shutil.which(configured) or shutil.which("c++")
     if compiler is None:
-        raise RuntimeError(
-            "native build requires a C++ compiler (c++/g++); "
-            "the portable NumPy/Python path remains available.")
-
-    caps = _cpu.detect()
+        return None
     variant_flag = "-mavx" if caps.get("has_avx", False) else "-msse2"
     flags = ["-O3", "-std=c++17", "-shared", "-fPIC",
              "-fno-fast-math", variant_flag]
@@ -42,10 +41,24 @@ def build_here(build_dir="", verbose: bool = True) -> str:
         " ".join(flags).encode("ascii")
     ).hexdigest()[:16]
     target = here / f"{_SO_NAME}-{variant_flag[1:]}-{digest}.so"
+    return compiler, flags, source, target
+
+
+def build_here(build_dir="", verbose: bool = True) -> str:
+    """Compile the optional native C++ kernels to a loadable shared library."""
+    import subprocess
+    import tempfile
+
+    resolved = _digest_and_target(_cpu.detect())
+    if resolved is None:
+        raise RuntimeError(
+            "native build requires a C++ compiler (c++/g++); "
+            "the portable NumPy/Python path remains available.")
+    compiler, flags, source, target = resolved
 
     # Compile to a temporary file, then atomically publish a complete library.
     # build_dir optionally controls scratch space, not the final load location.
-    scratch = Path(build_dir).resolve() if build_dir else here
+    scratch = Path(build_dir).resolve() if build_dir else target.parent
     scratch.mkdir(parents=True, exist_ok=True)
     fd, tmp_name = tempfile.mkstemp(
         prefix=f"{target.name}.{os.getpid()}.", suffix=".tmp.so", dir=scratch)
@@ -87,12 +100,26 @@ def try_load():
     try:
         import ctypes
         import glob
-        # Partial builds publish "<name>.so.<pid>.<rand>.tmp.so"; never let
-        # those shadow a complete library.
-        cands = [p for p in glob.glob(os.path.join(
-                     os.path.dirname(os.path.abspath(__file__)), "smaul_kernels*.so"))
-                 if ".tmp." not in os.path.basename(p)]
-        cands.sort(key=lambda p: os.path.getmtime(p), reverse=True)
+        here = os.path.dirname(os.path.abspath(__file__))
+        # Resolve the library matching the CURRENT source digest first. Loading
+        # whatever .so has the newest mtime once shadowed a fresh build with a
+        # stale one (the stale name embeds an older digest), so the digest
+        # path wins and discovery is only a fallback.
+        cands = []
+        advisory = None
+        resolved = _digest_and_target(caps)
+        if resolved is not None and resolved[3].is_file():
+            cands.append(str(resolved[3]))
+            all_names = [p for p in glob.glob(os.path.join(here, "smaul_kernels*.so"))
+                         if ".tmp." not in os.path.basename(p)]
+            if len(all_names) > 1:
+                advisory = "stale sibling builds present; current source digest build used"
+        if not cands:
+            # Partial builds publish "<name>.so.<pid>.<rand>.tmp.so"; never let
+            # those shadow a complete library.
+            cands = [p for p in glob.glob(os.path.join(here, "smaul_kernels*.so"))
+                     if ".tmp." not in os.path.basename(p)]
+            cands.sort(key=lambda p: os.path.getmtime(p), reverse=True)
         if not cands:
             return None, {"available": False,
                           "reason": "native module not built; using portable scalar/numpy path",
@@ -116,7 +143,7 @@ def try_load():
                                       ctypes.c_float, ctypes.c_int]
         lib.clone_perturb.restype = None
         return lib, {"available": True, "path": cands[0], "cpu": caps,
-                     "dispatch": _cpu.dispatch_name()}
+                     "dispatch": _cpu.dispatch_name(), "advisory": advisory}
     except (OSError, AttributeError) as e:
         return None, {"available": False, "reason": f"native load failed: {e}",
                       "cpu": caps}
