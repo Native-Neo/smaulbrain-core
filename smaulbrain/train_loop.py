@@ -353,7 +353,6 @@ class Trainer:
         if fail_at == "during_optinit":
             raise _Injected(fail_at)
         # commit: scheduler transition + atomic publish, then adopt
-        t0 = time.perf_counter()
         entry = {"id": pend["id"], "step": pend["step"], "reason": pend["reason"],
                  "prev_count": len(eids), "new_count": len(eids) + n_add,
                  "sources": pend["sources"], "new_ids": new_ids,
@@ -365,7 +364,6 @@ class Trainer:
             raise _Injected(fail_at)
         self._resize_router_opt_state(cand)  # part of the committed transition
         self._save_committed(cand, entry, new_ids)  # Phase B publish
-        entry["duration_s"] = time.perf_counter() - t0
         if fail_at == "after_commit":
             raise _Injected(fail_at)
         # only now adopt the candidate for continued execution
