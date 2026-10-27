@@ -17,6 +17,16 @@ def encode_bytes(data: bytes) -> list:
 
 
 def decode_ids(ids) -> bytes:
+    """Render token ids as bytes.
+
+    Special tokens (BOS/EOS/PAD, >= 256) are dropped: they have no byte-payload.
+    A failure raises. Any id outside the 259-token vocabulary indicates a
+    corrupted model or logits path and raises instead of silently vanishing.
+    """
+    ids = list(ids)
+    for tok in ids:
+        if not 0 <= int(tok) <= 258:
+            raise ValueError(f"token id {tok} outside the {VOCAB_SIZE}-token vocabulary")
     return bytes(int(i) for i in ids if 0 <= int(i) <= 255)
 
 
