@@ -1,5 +1,5 @@
 """Evidence-based expert pruning with atomic checkpoint replacement."""
-import numpy as np
+import math
 
 from . import checkpoint as _ckpt
 from . import growth as _growth
@@ -7,7 +7,7 @@ from . import model as _model
 from .npgrad import Tensor
 
 
-def rank_for_prune(params: dict, scores: dict, n_remove: int, top_k: int, n_experts: int):
+def rank_for_prune(scores: dict, n_remove: int, top_k: int, n_experts: int):
     if n_remove <= 0:
         raise ValueError("--rm-worst must be positive")
     if n_remove >= n_experts:
@@ -16,6 +16,10 @@ def rank_for_prune(params: dict, scores: dict, n_remove: int, top_k: int, n_expe
     if n_experts - n_remove < top_k:
         raise ValueError(f"removal would leave {n_experts - n_remove} experts, "
                          f"violating top_k={top_k}")
+    for eid, score in scores.items():
+        if not math.isfinite(float(score)):
+            raise ValueError(f"non-finite quality score for expert {eid}; "
+                             "pruning evidence is unusable")
     order = sorted(scores.items(), key=lambda kv: (kv[1], kv[0]))
     return [eid for eid, _ in order[:n_remove]]
 
@@ -39,7 +43,7 @@ def prune_checkpoint(ckpt_dir: str, rm_worst: int, eval_batches, min_samples: in
     if scores is None:
         raise RuntimeError(f"insufficient quality evidence ({nsamp} < {min_samples}); "
                            f"pruning refused")
-    victims = rank_for_prune(params, scores, rm_worst, spec.top_k, len(eids))
+    victims = rank_for_prune(scores, rm_worst, spec.top_k, len(eids))
     report = {"candidates": victims,
               "scores": {str(v): scores[v] for v in victims},
               "samples": nsamp,

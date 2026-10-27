@@ -186,8 +186,11 @@ def eval_loss_on_tokens_disabled(model, tokens, disabled):
 
 
 def prepare_sources(scores: dict, n_needed: int):
+    if any(not math.isfinite(float(s)) for s in scores.values()):
+        return None  # unusable evidence anywhere: ranking cannot be trusted
     order = sorted(scores.items(), key=lambda kv: (-kv[1], kv[0]))
-    if len(order) < n_needed or any(not math.isfinite(float(s)) for _, s in order[:n_needed]): return None
+    if len(order) < n_needed:
+        return None
     return [eid for eid, _ in order[:n_needed]]
 
 
