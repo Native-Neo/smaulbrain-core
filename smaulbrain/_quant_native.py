@@ -779,7 +779,10 @@ def fp8_e4m3_quantize(W: np.ndarray, scale=None):
             scale = np.float32(scale)
         except (OverflowError, ValueError):
             scale = np.float32(np.inf if float(scale) > 0 else (-np.inf if float(scale) < 0 else 0.0))
-        if not np.isfinite(scale) and scale == 0:
+        if not np.isfinite(scale) or scale == 0:
+            # An unsalvageable explicit scale (NaN/Inf/0) would saturate every
+            # element silently: NaNs and infs select the zero code, a zero
+            # scale divides by zero.  Fall back to the neutral scale instead.
             scale = np.float32(1.0)
     if scale == 0:
         scale = np.float32(1.0)
