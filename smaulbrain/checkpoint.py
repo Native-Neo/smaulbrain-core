@@ -85,17 +85,36 @@ def _write_tree(target_dir, manifest, params, opt_state):
         man["files"] = {"params.safetensors": _sha256(pp), "optim.safetensors": _sha256(op)}
         with open(os.path.join(tmp, "manifest.json"), "w") as f:
             json.dump(man, f, indent=2, default=_json_default)
+            f.flush()
+            os.fsync(f.fileno())
         _publish_dir(tmp, target_dir)
+        _sync_parent(target_dir)
         return target_dir
     except BaseException:
         shutil.rmtree(tmp, ignore_errors=True)
         raise
 
 
+def _sync_parent(path):
+    """Flush a directory entry so a rename survives an actual power loss."""
+    try:
+        fd = os.open(os.path.dirname(os.path.normpath(path)), os.O_RDONLY)
+    except OSError:
+        return
+    try:
+        os.fsync(fd)
+    except OSError:
+        pass
+    finally:
+        os.close(fd)
+
+
 def _publish_dir(tmp, target_dir):
     target_dir = os.path.normpath(target_dir)
+    _sync_parent(tmp)
     if not os.path.exists(target_dir):
         os.replace(tmp, target_dir)
+        _sync_parent(target_dir)
         return
     bak = target_dir + ".bak"
     if os.path.exists(bak):
@@ -103,6 +122,7 @@ def _publish_dir(tmp, target_dir):
     os.rename(target_dir, bak)
     try:
         os.rename(tmp, target_dir)
+        _sync_parent(target_dir)
     except BaseException:
         os.rename(bak, target_dir)
         raise
