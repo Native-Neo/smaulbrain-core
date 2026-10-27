@@ -245,22 +245,43 @@ class Tensor:
             axes = tuple(axes[0])
         return transpose(self, tuple(axes))
 
-    def mean(self, dim=None, keepdim=False, axis=None, keepdims=None):
+    def mean(self, dim=None, keepdim=False, axis=None, keepdims=None,
+             dtype=None, out=None, initial=None, where=None):
+        if out is not None or initial is not None or where is not None:
+            # numpy-style imperative reduction on the data; no grad graph.
+            ax = dim if axis is None else axis
+            kd = keepdim if keepdims is None else keepdims
+            return np.mean(self.data, axis=ax, dtype=dtype, keepdims=kd,
+                           **({"out": out} if out is not None else {}),
+                           **({"initial": initial} if initial is not None else {}),
+                           **({"where": where} if where is not None else {}))
         if axis is not None:
             dim = axis
         if keepdims is not None:
             keepdim = keepdims
-        return mean(self, axis=dim, keepdims=keepdim)
+        result = mean(self, axis=dim, keepdims=keepdim)
+        if dtype is not None and np.dtype(dtype) != result.dtype:
+            return Tensor(result.data.astype(dtype), result.requires_grad)
+        return result
 
-    def sum(self, dim=None, keepdim=False, dtype=None, axis=None, keepdims=None):
+    def sum(self, dim=None, keepdim=False, dtype=None, axis=None, keepdims=None,
+            out=None, initial=None, where=None):
+        if out is not None or initial is not None or where is not None:
+            # numpy-style imperative reduction on the data; no grad graph.
+            ax = dim if axis is None else axis
+            kd = keepdim if keepdims is None else keepdims
+            return np.sum(self.data, axis=ax, dtype=dtype, keepdims=kd,
+                          **({"out": out} if out is not None else {}),
+                          **({"initial": initial} if initial is not None else {}),
+                          **({"where": where} if where is not None else {}))
         if axis is not None:
             dim = axis
         if keepdims is not None:
             keepdim = keepdims
-        out = sum(self, axis=dim, keepdims=keepdim)
-        if dtype is not None and np.dtype(dtype) != out.dtype:
-            return Tensor(out.data.astype(dtype), out.requires_grad)
-        return out
+        total = sum(self, axis=dim, keepdims=keepdim)
+        if dtype is not None and np.dtype(dtype) != total.dtype:
+            return Tensor(total.data.astype(dtype), total.requires_grad)
+        return total
 
     def square(self):
         return square(self)
@@ -428,8 +449,19 @@ class Tensor:
     def __repr__(self):
         return f"Tensor(shape={self.shape}, dtype={self.dtype}, requires_grad={self.requires_grad})"
 
-    def __array__(self, dtype=None):
-        return self.data if dtype is None else self.data.astype(dtype)
+    def __array__(self, dtype=None, copy=None):
+        # NumPy 2.x protocol: ``copy`` may be True/False/None. On request
+        # without ``copy=False`` a conversion may freely make a new buffer;
+        # with copy=False the zero-copy path is only valid for identical
+        # dtypes, matching ndarray behavior.
+        arr = self.data
+        if dtype is not None and np.dtype(dtype) != arr.dtype:
+            if copy is False:
+                raise ValueError("Unable to avoid copy: dtype conversion requested")
+            arr = arr.astype(dtype) if copy is None else arr.astype(dtype, copy=True)
+        elif copy:
+            arr = arr.copy()
+        return arr
 
 
 class Parameter(Tensor):
@@ -835,12 +867,24 @@ def sum(a, axis=None, keepdims=False):
 
 def mean(a, axis=None, keepdims=False):
     a = _t(a)
-    n = a.numel() if axis is None else a.shape[axis]
+    if axis is None:
+        n = a.numel()
+    elif isinstance(axis, (tuple, list)):
+        n = 1
+        for ax in axis:
+            n *= a.shape[ax]
+    else:
+        n = a.shape[axis]
+    if n == 0:
+        n = 1  # avoids a divide by zero for zero-sized reductions
 
     def bw(g):
         gg = np.asarray(g) / n
         if axis is not None and not keepdims:
-            gg = np.expand_dims(gg, axis)
+            if isinstance(axis, (tuple, list)):
+                gg = np.expand_dims(gg, tuple(int(x) for x in axis))
+            else:
+                gg = np.expand_dims(gg, axis)
         return (_unbroadcast(np.broadcast_to(gg, a.shape).copy(), a.shape),)
 
     return make_op(np.mean(a.data, axis=axis, keepdims=keepdims), (a,), bw, cache=False)
