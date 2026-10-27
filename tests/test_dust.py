@@ -201,6 +201,80 @@ def test_direct_estimator_matches_exact_gradient_on_one_token():
     assert 0.6 < ratio < 1.5
 
 
+_STATS = {"block_evals": 0, "local_block_evals": 0, "head_column_evals": 0,
+          "draws": 0, "local_draws": 0, "head_draws": 0,
+          "scalar_forwards": 0, "draw_batches": 0, "temp_bytes": 0}
+
+
+def test_batch_centered_reward_correction_restores_linear_scale():
+    # The documented estimator is -(1/(K sigma)) sum_i r_i a_i.  Removing the
+    # per-batch reward mean shrinks E[c_i a_i] by (n - 1)/n; the correction
+    # multiplies the centered batch by n/(n - 1) exactly, so the scale law is
+    # independent of the draw batch size.  Pure linear rewards
+    # r_i = -sigma * <g, a_i> + mu make the analytic corrigendum exact: the
+    # corrected estimator returns g, the pre-fix batch-centred-only variant
+    # returns ((n - 1) / n) * g.  mu is a constant mean-reward term (dust
+    # rewards have one from second-order loss growth); its scale is ~ the
+    # per-draw signal so it does not dominate the Monte-Carlo window, and
+    # batch-centering must strip it in both variants.
+    rng = np.random.default_rng(500)
+    d, K, sigma = 8, 512, 0.05
+    g = rng.standard_normal(d)
+    mu = 0.005
+    reps = 24
+    for n in (1, 2, 4, 8):
+        corrected_sum = np.zeros((1, d))
+        bugged_sum = np.zeros((1, d))
+        for _ in range(reps):
+            for _ in range(K // n):
+                a = rng.standard_normal((n, 1, d))
+                r = -(sigma * (a @ g)) + mu
+                if n > 1:
+                    rb = r - r.mean(axis=0, keepdims=True)
+                    rb *= n / (n - 1)
+                    corrected_sum -= np.einsum("nt,ntd->td", rb, a) / sigma
+                    bugged_sum -= np.einsum(
+                        "nt,ntd->td", r - r.mean(axis=0, keepdims=True), a) / sigma
+                else:
+                    corrected_sum -= np.einsum("nt,ntd->td", r, a) / sigma
+        corrected = corrected_sum / (reps * K)
+        np.testing.assert_allclose(corrected, g[None, :], rtol=0.10, atol=0.10)
+        if n > 1:
+            bugged = bugged_sum / (reps * K)
+            np.testing.assert_allclose(
+                bugged, ((n - 1) / n) * g[None, :], rtol=0.10, atol=0.10)
+
+
+def test_direct_estimator_scale_is_chunk_invariant():
+    # The draw batch size is a performance knob.  After the n/(n - 1)
+    # correction the estimator's expected scale no longer depends on it:
+    # at T=1 there is no cross-token credit ambiguity, so the mean norm
+    # ratio against the exact autograd gradient is ~1 for every chunk.
+    model, _ = _model()
+    toks = _tokens(6, 2)  # one predictor token
+    exact = _capture_y_grads(model, toks, layer=0)
+    exact_norm = np.linalg.norm(exact)
+    clean = dust.DustForward(model).capture(toks)
+    engine = dust.DustEngine(model, _small_config())
+    key = "L0.attn.hub"
+    per_chunk = {}
+    for chunk in (1, 2, 4, 64):
+        ratios = []
+        for s in range(4):
+            stats = dict(_STATS)
+            cfgv = _small_config(chunk=chunk)
+            engine_c = dust.DustEngine(model, cfgv)
+            err = engine_c._direct_group(
+                clean.x_in[0], 0, [key], {key: engine_c.d}, 512, 0.05,
+                np.random.default_rng(s), clean, stats)[key]
+            ratios.append(np.linalg.norm(err) / exact_norm)
+        per_chunk[chunk] = float(np.mean(ratios))
+    span = max(per_chunk.values()) - min(per_chunk.values())
+    assert span < 0.2, per_chunk
+    for chunk, mean_ratio in per_chunk.items():
+        assert 0.85 < mean_ratio < 1.15, (chunk, mean_ratio, per_chunk)
+
+
 def test_batched_direct_groups_match_separate_forwards():
     # The fast path evaluates hub/writer/hidden groups as one batch with zeros
     # outside each group's row.  It must reproduce separate forwards exactly
