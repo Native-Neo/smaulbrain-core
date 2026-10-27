@@ -411,6 +411,23 @@ def test_fp8_quantized_path_with_bf16_activation_storage():
     assert all(np.isfinite(P.gradient_array(g)).all() for g in grads.values())
 
 
+def test_fp8_explicit_unsalvageable_scale_falls_back_to_neutral():
+    # NaN/Inf/0 scales cannot represent anything: they used to saturate every
+    # weight to the zero code (non-finite scale) or divide by zero (0).
+    # The quantizer must fall back to the neutral scale 1.0 instead of
+    # returning poisoned values silently.
+    x = np.array([0.25, -0.5, 1.75, 3.0], np.float32)
+    reference, ref_scale = quant.fp8_e4m3_quantize(x, scale=np.float32(1.0))
+    assert ref_scale == np.float32(1.0)
+    for bad in (np.nan, np.inf, -np.inf, np.float32(0.0), np.float32(-0.0)):
+        got, got_scale = quant.fp8_e4m3_quantize(x, scale=bad)
+        assert got_scale == np.float32(1.0), (bad, got_scale)
+        np.testing.assert_array_equal(got, reference)
+        # And the round-trip stays meaningful: the decode preserves the sign
+        # structure instead of collapsing everything to zero.
+        np.testing.assert_array_equal(np.sign(got), np.sign(x))
+
+
 # ---------------------------------------------------------------------------
 # Loss normalization and checkpoint compatibility
 # ---------------------------------------------------------------------------
