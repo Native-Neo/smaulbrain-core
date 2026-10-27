@@ -1,9 +1,16 @@
 """Inference engine using NumPy arrays and persistent recurrent state.
 
-Speculative decoding (opt-in via ``speculative=K``) uses the model's MTP modules
-to draft tokens after the normally sampled one, verifies them with a single
-batched main-model forward, and accepts the matching prefix. Sampling and
-acceptance math are unchanged from the PyTorch implementation.
+State seam: ``prefill(tokens)`` consumes the prompt and leaves the pending
+distribution for the next token in ``_pending_logits``; ``generate_stream``
+consumes that pending distribution instead of re-stepping the prompt's last
+token. ``prefill(p) + generate([])`` is therefore token-identical to
+``generate(p)`` for both plain and speculative decoding. Only the purely
+degenerate case (fresh engine, empty prompt, no history) keeps the historical
+byte-0 seed. Speculative decoding (opt-in via ``speculative=K``) uses the
+model's MTP modules to draft tokens after the normally sampled one, verifies
+them with a single batched main-model forward, and accepts the matching
+prefix. Sampling and acceptance math are unchanged from the PyTorch
+implementation.
 """
 from __future__ import annotations
 
@@ -41,10 +48,14 @@ class InferenceEngine:
         self.generator = np.random.default_rng(int(seed))
         self.states = model.init_states()
         self._reset_mtp()
+        self._pending_logits = None
+        self._last_plain_token = None
 
     def reset(self):
         self.states = self.model.init_states()
         self._reset_mtp()
+        self._pending_logits = None
+        self._last_plain_token = None
 
     # -- persistent state (main recurrent layers + optional MTP pipeline) --
     def export_states(self):
@@ -66,6 +77,8 @@ class InferenceEngine:
         main = {k: v for k, v in blob.items() if k != "mtp"}
         self.states = [np.asarray(s, dtype=np.float32) for s in self.model.restore_states(main)]
         self._reset_mtp()
+        self._pending_logits = None
+        self._last_plain_token = None
         mtp = blob.get("mtp")
         if mtp is None or not self._mtp_ready:
             self._mtp_ready = False
@@ -164,21 +177,27 @@ class InferenceEngine:
     def prefill(self, tokens, chunk=0):
         toks = list(tokens)
         if not toks:
+            # Pure no-op: states are untouched, so a pending distribution left
+            # by earlier consumption stays valid.
             return self.states
+        self._pending_logits = None
         if not self._mtp_ready and self.draft_depth > 0:
             self._reset_mtp()
         if not self._mtp_ready:
             if chunk and chunk > 0:
                 for i in range(0, len(toks), chunk):
-                    self.model.forward(toks[i:i + chunk], states=self.states)
+                    logits, _ = self.model.forward(toks[i:i + chunk], states=self.states)
+                    self._pending_logits = _arr(logits[-1])
             elif toks:
-                self.model.forward(toks, states=self.states)
+                logits, _ = self.model.forward(toks, states=self.states)
+                self._pending_logits = _arr(logits[-1])
             return self.states
         step = chunk if chunk and chunk > 0 else 512
         for i in range(0, len(toks), step):
             seg = toks[i:i + step]
             base = self._tok_base + len(self._toks)
-            _logits, hidden = self.model.hidden_forward(seg, self.states)
+            logits, hidden = self.model.hidden_forward(seg, self.states)
+            self._pending_logits = _arr(logits[-1])
             for j in range(hidden.shape[0]):
                 self._ring_put(self._h0, base + j, hidden[j])
             self._toks.extend(int(x) for x in seg)
@@ -242,24 +261,55 @@ class InferenceEngine:
     def generate(self, prompt_tokens, max_new_tokens=64, stop_ids=()):
         return list(self.generate_stream(prompt_tokens, max_new_tokens, stop_ids))
 
+    def _consume_pending_logits(self):
+        pending = self._pending_logits
+        self._pending_logits = None
+        return pending
+
     def generate_stream(self, prompt_tokens, max_new_tokens=64, stop_ids=()):
         prompt = list(prompt_tokens)
         self.prefill(prompt)
         stop = set(stop_ids)
         if not (self._mtp_ready and self.speculative > 0):
-            last = prompt[-1] if prompt else 0
+            # ``prefill`` already consumed the prompt and left the
+            # distribution for the next token in ``_pending_logits``.  Start
+            # there instead of re-stepping the prompt's last token (historical
+            # behavior, which double-consumed it) or a literal seed byte.
+            pending = self._consume_pending_logits()
+            if pending is None:
+                if self._last_plain_token is not None:
+                    pending = self.model.step_token(self._last_plain_token, self.states)
+                else:
+                    # Fresh engine without any context keeps the historical
+                    # byte-0 seed for that degenerate case.
+                    pending = self.model.step_token(0, self.states)
             for _ in range(max_new_tokens):
-                nxt = self._sample(self.model.step_token(last, self.states))
-                last = nxt
+                nxt = self._sample(pending)
+                self._last_plain_token = nxt
                 yield nxt
                 if nxt in stop:
-                    break
+                    self._pending_logits = None
+                    return
+                self._pending_logits = pending = self.model.step_token(nxt, self.states)
+            self._last_plain_token = nxt
             return
-        last = self._toks[-1] if self._toks else 0
-        if not self._unconsumed:
-            self._toks.append(int(last))
+        pending = self._consume_pending_logits()
+        if pending is None:
+            # No fresh distribution (fresh engine, or restored states): keep
+            # the legacy behavior of stepping the tracked last token.
+            last = self._toks[-1] if self._toks else 0
+            if not self._unconsumed:
+                self._toks.append(int(last))
+            self._unconsumed = True
+            yield from self._generate_speculative(max_new_tokens, stop)
+            return
+        # After prefill the last prompt token is already consumed and its
+        # hidden vector is on the _h0 ring; step straight from the pending
+        # distribution.
+        pos = self._tok_base + len(self._toks) - 1
         self._unconsumed = True
-        yield from self._generate_speculative(last, max_new_tokens, stop)
+        yield from self._generate_speculative(
+            max_new_tokens, stop, pending=pending, seed_pos=pos)
 
     def _mtp_draft(self, pos):
         drafts = []
@@ -309,13 +359,24 @@ class InferenceEngine:
     def _rollback(self, hist, idx):
         self.states = [hist[l][idx].copy() for l in range(len(self.states))]
 
-    def _generate_speculative(self, last, max_new_tokens, stop):
+    def _generate_speculative(self, max_new_tokens, stop, pending=None, seed_pos=None):
+        # ``pending`` marks an already-consumed seed: the token at ``seed_pos``
+        # was consumed by ``prefill`` (its hidden lives on the _h0 ring) and
+        # ``pending`` describes what follows it. The loop must not re-step it;
+        # later iterations revert to the legacy ``last``-consumed path.
+        last = self._toks[-1] if self._toks else 0
         remaining = int(max_new_tokens)
+        step_from_pending = pending is not None
         while remaining > 0:
-            logits, h0 = self.model.step_details(last, self.states)
-            self._unconsumed = False
-            pos = self._tok_base + len(self._toks) - 1
-            self._ring_put(self._h0, pos, h0)
+            if step_from_pending:
+                logits = pending
+                pos = seed_pos
+                step_from_pending = False
+            else:
+                logits, h0 = self.model.step_details(last, self.states)
+                self._unconsumed = False
+                pos = self._tok_base + len(self._toks) - 1
+                self._ring_put(self._h0, pos, h0)
             t1 = self._sample(logits)
             self._toks.append(int(t1))
             self._unconsumed = True
