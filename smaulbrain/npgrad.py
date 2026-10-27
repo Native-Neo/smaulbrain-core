@@ -1178,8 +1178,11 @@ def scan(values, alpha, s0=None):
     """s_t = alpha * s_{t-1} + values_t, returned for every t.
 
     ``values`` has shape (..., T, D); ``alpha`` has shape (D,). ``s0`` is an
-    optional (..., D) initial state. No Python loop over positions: each chunk
-    uses a cumulative sum of exponentially weighted values.
+    optional (..., D) initial state. No Python loop over positions in the
+    common regime: each chunk uses a cumulative sum of exponentially
+    weighted values. If any alpha channel falls below 1e-8 (or is
+    non-finite), an exact sequential recurrence replaces the chunked closed
+    form, which is only stable for alphas inside the fp32 power range.
     """
     values, alpha = _t(values), _t(alpha)
     one_dim = values.ndim == 2
@@ -1226,11 +1229,25 @@ def scan(values, alpha, s0=None):
     initial = None if s0 is None else (_t(s0).data[None, :] if one_dim else _t(s0).data)
     if initial is None:
         initial = np.zeros(v.shape[:-2] + (v.shape[-1],), dtype=DTYPE)
-    out = _scan_forward(v, a, chunk, initial)
+    # The chunked closed form divides by alpha**steps.  Once a channel's
+    # alpha**chunk sinks below the fp32 normal range that division overflows
+    # to inf and the rescale produces NaN (inf * 0); alpha == 0 underflows
+    # outright.  Those values sit far outside the trained regime
+    # (exp(-softplus(w)) >= 1e-8 keeps the closed form safe), so fall back
+    # to the exact sequential recurrence, which cannot reproduce the NaN.
+    fallback = not (bool(np.isfinite(a).all())
+                    and (float(a.min()) >= 1e-8 if a.size else True))
+    if fallback:
+        out = _scan_sequential_forward(v, a, initial)
+    else:
+        out = _scan_forward(v, a, chunk, initial)
 
     def bw(g):
         g = g[None, :, :] if one_dim else g
-        dvalues, dalpha, ds0 = _scan_backward(g, out, a, initial, chunk)
+        if fallback:
+            dvalues, dalpha, ds0 = _scan_sequential_backward(g, out, a, initial)
+        else:
+            dvalues, dalpha, ds0 = _scan_backward(g, out, a, initial, chunk)
         if one_dim:
             dvalues = dvalues[0]
             ds0 = ds0[0]
@@ -1242,6 +1259,51 @@ def scan(values, alpha, s0=None):
     # The recurrent scan output is also the state history; keep it at the
     # runtime precision (see PORT_NOTES.md).
     return make_op(out[0] if one_dim else out, inputs, bw, cache=False)
+
+
+def _scan_sequential_forward(values, alpha, s0):
+    """Straight recurrence; the only stable path for degenerate ``alpha``.
+
+    The chunked closed form divides by ``alpha**k``: once any channel's
+    ``alpha**chunk`` underflows the fp32 normal range the division overflows
+    to ``inf`` and the rescale turns it into ``NaN`` (``0 * inf``). The raw
+    recurrence cannot reproduce that, so it runs whenever a channel's alpha
+    falls below the safe power range, including alpha == 0 exactly.
+    """
+    lead = values.shape[:-2]
+    a = alpha.reshape((1,) * len(lead) + (1, alpha.shape[-1]))
+    state = np.array(s0, dtype=DTYPE, copy=True)
+    outs = np.empty_like(values, dtype=DTYPE)
+    for t in range(values.shape[-2]):
+        state = a * state + values[..., t, :]
+        outs[..., t, :] = state
+    return outs
+
+
+def _scan_sequential_backward(grad, states, alpha, s0):
+    """Backward of the straight recurrence (``_scan_sequential_forward``).
+
+    ``s_t = alpha * s_{t-1} + values_t`` gives ``ds_t = g_t + alpha * ds_{t+1}``,
+    ``dalpha`` accumulated over ``ds_t * s_{t-1}`` in float64, exactly like
+    ``_scan_backward``.
+    """
+    lead = grad.shape[:-2]
+    T, D = grad.shape[-2], grad.shape[-1]
+    a = alpha.reshape((1,) * len(lead) + (1, D))
+    dvalues = np.empty_like(grad, dtype=DTYPE)
+    dalpha = np.zeros(D, dtype=np.float64) if T == 0 else np.zeros(alpha.shape, dtype=np.float64)
+    ds0 = np.zeros(lead + (D,), dtype=DTYPE)
+    carry = np.zeros(lead + (D,), dtype=DTYPE)
+    for t in range(T - 1, -1, -1):
+        carry = grad[..., t, :] + a * carry
+        dvalues[..., t, :] = carry
+    if T > 0:
+        prev = np.concatenate([np.broadcast_to(np.asarray(s0, dtype=DTYPE), lead + (1, D)),
+                               states[..., : T - 1, :]], axis=-2)
+        ds0 = dvalues[..., 0, :] * alpha
+        dalpha = np.sum(dvalues.astype(np.float64) * prev.astype(np.float64),
+                        axis=tuple(range(len(lead) + 1)))
+    return dvalues, dalpha, ds0
 
 
 def _scan_backward(grad, states, alpha, s0, chunk):
