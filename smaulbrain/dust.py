@@ -24,6 +24,15 @@ and the weight gradient is the same local outer product backprop uses,
 
     G_hat_W = sum_t g_hat_t x_t^T.
 
+Draws are evaluated in batches of ``n`` (the ``chunk`` performance knob).
+Within each batch the reward mean is removed, which is unbiased variance
+reduction because the noise draws have zero mean regardless of the rewards.
+The realized batch mean, however, correlates with its own draws: left
+uncorrected it biases the credited term ``E[c_i a_i]`` by ``(n - 1)/n`` per
+batch, so the estimator's scale would depend on ``chunk``.  Each centered
+batch is therefore rescaled by ``n / (n - 1)``, restoring the estimator above
+exactly in the linear regime and making ``chunk`` a pure performance knob.
+
 Attention internals are not credited by the token loss directly.  They are
 scored by how much their perturbation changes the attention output, using the
 estimated error at that output:
@@ -576,6 +585,12 @@ class DustEngine:
             reward = clean.loss[None, :] - perturbed
             if n > 1:
                 reward = reward - reward.mean(axis=0, keepdims=True)
+                # Removing the batch mean is unbiased variance reduction, but
+                # the realized mean correlates with its own draws: it biases
+                # E[c_i a_i] by (n - 1)/n per batch.  Rescale so the
+                # estimator keeps the documented 1/(K sigma) scale for any
+                # ``chunk``.
+                reward *= np.float32(n) / np.float32(n - 1)
             for site in sites:
                 errors[site] -= np.einsum(
                     "nt,ntd->td", reward, noise[site],
@@ -652,6 +667,10 @@ class DustEngine:
                 reward = clean.loss[None, :] - perturbed[offset:offset + n]
                 if n > 1:
                     reward = reward - reward.mean(axis=0, keepdims=True)
+                    # See _direct_group: undo the (n - 1)/n shrink of the
+                    # batch-centered reward so the estimator keeps the
+                    # documented 1/(K sigma) scale for any ``chunk``.
+                    reward *= np.float32(n) / np.float32(n - 1)
                 for site in group["sites"]:
                     errors[site] -= np.einsum(
                         "nt,ntd->td", reward, group_noise[gi][site],
@@ -724,6 +743,10 @@ class DustEngine:
                 reward = clean_loss32[None, :] - loss
                 if n > 1:
                     reward = reward - reward.mean(axis=0, keepdims=True)
+                    # See _direct_group: undo the (n - 1)/n shrink of the
+                    # batch-centered reward.  The sigma division stays folded
+                    # into the einsum below.
+                    reward *= np.float32(n) / np.float32(n - 1)
                 error[:, lo:hi] -= np.einsum(
                     "nt,ntd->td", reward / sigma, noise,
                     optimize=False)
