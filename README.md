@@ -287,8 +287,9 @@ What is implemented:
   writer/hub/embedding sites. Attention internals are credited through the
   estimated attention-output error, as in the paper.
 - An independent NumPy forward (`smaulbrain/dust.py`) that never calls the
-  autograd tape or `Model.loss_and_backward`. Clean-forward and from-block
-  rerun parity are covered by tests.
+  autograd tape or `Model.loss_and_backward`; it delegates the recurrent scan
+  to the shared `npgrad.scan` kernel, which records no grad history for plain
+  array inputs. Clean-forward and from-block rerun parity are covered by tests.
 - SGD with momentum, configurable draws/sigmas/gamma/seed, deterministic
   per-step perturbation RNG, and exact checkpoint resume. The checkpoint
   manifest records `algorithm: dust` and the full Dust configuration, and
@@ -354,7 +355,12 @@ default credit decay is 0.5, chosen to match the recurrence decay; the paper's
 0.98 is available explicitly. `--dust-grad-clip` defaults to 0 (no clipping).
 `--grad-clip` is backprop's clipping flag; passing a non-default value in Dust
 mode while `--dust-grad-clip` is left at 0 is rejected with a pointer to
-`--dust-grad-clip` rather than being silently ignored.
+`--dust-grad-clip` rather than being silently ignored. Each draw batch has its
+reward mean removed and is rescaled by `n/(n-1)`, restoring the documented
+`1/(K*sigma)` estimator scale, so `--dust-chunk` and the per-group draw counts
+change variance only, not the expected gradient scale; the rows in
+`benchmarks/DUST_RESULTS.md` predate this correction and measured smaller
+direct-site scales.
 
 `benchmarks/dust_benchmark.py` runs matched backprop and Dust configurations
 in fresh subprocesses and reports held-out loss, training time, peak RSS,
