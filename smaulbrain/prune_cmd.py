@@ -8,6 +8,10 @@ from .npgrad import Tensor
 
 
 def rank_for_prune(scores: dict, n_remove: int, top_k: int, n_experts: int):
+    for eid, score in scores.items():
+        if not math.isfinite(float(score)):
+            raise ValueError(f"non-finite quality score for expert {eid}; "
+                             "pruning evidence is unusable")
     if n_remove <= 0:
         raise ValueError("--rm-worst must be positive")
     if n_remove >= n_experts:
@@ -16,10 +20,6 @@ def rank_for_prune(scores: dict, n_remove: int, top_k: int, n_experts: int):
     if n_experts - n_remove < top_k:
         raise ValueError(f"removal would leave {n_experts - n_remove} experts, "
                          f"violating top_k={top_k}")
-    for eid, score in scores.items():
-        if not math.isfinite(float(score)):
-            raise ValueError(f"non-finite quality score for expert {eid}; "
-                             "pruning evidence is unusable")
     order = sorted(scores.items(), key=lambda kv: (kv[1], kv[0]))
     return [eid for eid, _ in order[:n_remove]]
 
