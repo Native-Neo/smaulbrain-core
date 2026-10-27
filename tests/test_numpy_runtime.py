@@ -1,3 +1,7 @@
+import os
+import shutil
+import time
+
 import numpy as np
 import pytest
 
@@ -427,3 +431,66 @@ def test_checkpoint_and_inference_roundtrip(tmp_path):
     eng.prefill(toks)
     second = eng.generate([], max_new_tokens=5)
     assert first == second
+
+
+def test_sweep_stale_checkpoints_reaps_crash_debris(tmp_path):
+    """A killed save must not leave debris, and survivors must stay intact."""
+    spec = cfg.PRESETS["dense-tiny"]
+    m = model.Model(spec, model.build_params(spec, np.random.default_rng(4)))
+    opt = smaulopt.SmaulOPT()
+    opt.register(m.p)
+    man = ckpt.build_manifest(
+        "dense-tiny", {}, {"seq_len": 8},
+        ckpt.blank_scheduler_state(), 0,
+        {"bit_generator": np.random.default_rng(0).bit_generator.state},
+        0, [], {},
+    )
+    ckpt.save_checkpoint(str(tmp_path / "run"), man, m.p, opt.state_dict())
+
+    # Stale publication debris an unlucky SIGKILL would leave behind.
+    orphan = tmp_path / (ckpt._CKPT_TMP_PREFIX + "stale")
+    orphan.mkdir()
+    (orphan / "junk.bin").write_bytes(b"x")
+    partial_bak = tmp_path / "run.bak"
+    partial_bak.mkdir()
+    (partial_bak / "half.safetensors").write_bytes(b"x")
+    ancient = time.time() - 3600.0
+    for stale in (orphan, partial_bak):
+        os.utime(stale, (ancient, ancient))
+
+    # A fresh .ckpt.* tree represents a plausible concurrent writer and must
+    # survive the grace window.
+    fresh_tmp = tmp_path / (ckpt._CKPT_TMP_PREFIX + "fresh")
+    fresh_tmp.mkdir()
+
+    ckpt.save_checkpoint(str(tmp_path / "run"), man, m.p, opt.state_dict())
+
+    assert not orphan.exists()
+    assert not partial_bak.exists()
+    assert fresh_tmp.exists()
+    assert ckpt.load_checkpoint(str(tmp_path / "run"))["manifest"][
+        "preset"] == "dense-tiny"
+
+    # The public helper reaps cold .ckpt.* debris without a save, leaving
+    # fresh temporaries alone.
+    orphan2 = tmp_path / (ckpt._CKPT_TMP_PREFIX + "stale2")
+    orphan2.mkdir()
+    os.utime(orphan2, (ancient, ancient))
+    removed = ckpt.sweep_stale_checkpoints(str(tmp_path / "run"), grace=10.0)
+    assert not orphan2.exists()
+    assert fresh_tmp.exists()
+    assert any(p.endswith("stale2") for p in removed)
+
+    # Crash mid-publish: the renamed old tree (with a manifest) is the only
+    # complete checkpoint while the target itself is incomplete.  The sweep
+    # must preserve it, and the loader must be able to use it.
+    run = tmp_path / "run"
+    shutil.copytree(run, run.parent / "run.bak")
+    (run / "manifest.json").unlink()
+    for path in (run, run.parent / "run.bak"):
+        os.utime(path, (ancient, ancient))
+    removed = ckpt.sweep_stale_checkpoints(str(run), grace=10.0)
+    assert (run.parent / "run.bak").exists()
+    shutil.rmtree(run)
+    os.rename(run.parent / "run.bak", run)
+    assert ckpt.load_checkpoint(str(run))["manifest"]["preset"] == "dense-tiny"
