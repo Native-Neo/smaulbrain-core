@@ -328,6 +328,18 @@ class Model:
             elif value.grad is not None:
                 _precision.zero_gradient(value.grad)
 
+    def invalidate_quant_caches(self, keys=None):
+        """Drop packed-ternary/FP8 views for updated parameters.
+
+        In-place parameter updates (the optimizer step) silently stale every
+        packed/FP8 view, so any code path that updates ``self.p`` must call
+        this afterwards. ``keys`` restricts the work to the updated names;
+        ``None`` drops everything (growth, paging adopt, manual mutation of
+        unknown provenance).
+        """
+        self.packed.invalidate(keys)
+        self.fp8.invalidate(keys)
+
     def train(self, mode=True):
         return self
 
