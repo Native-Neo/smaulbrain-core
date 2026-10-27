@@ -99,6 +99,12 @@ not invoked.
   512 draws, local attention R about 0.97 and K/V about 0.88 with gamma
   0.5-0.7, and head slabs about 0.96 at 4096 draws; the tests use conservative
   thresholds below those diagnostics;
+- the fused reward scale of the batch-centered rewards: a synthetic
+  linear-reward Monte Carlo pins the `n/(n-1)` correction that restores the
+  documented `1/(K sigma)` scale for any draw batch (and matches the
+  pre-fix centered-only branch to its analytically biased `(n-1)/n` scale),
+  plus the real hub estimator's norm ratio against exact autograd held to
+  `0.85-1.15` with cross-chunk span `< 0.2` for draw batches 1-64;
 - uneven head-slab partitions;
 - the no-backward invariant;
 - deterministic gradients for a fixed seed/step and different gradients for a
@@ -115,8 +121,9 @@ not invoked.
 - CLI/config validation, including negative perturbation seeds, unsupported
   MoE/MTP/quantized/storage configurations, and NaN/Inf rejection.
 
-`python -m pytest -q` passes 82 tests (39 Dust, 43 existing) in about 7-8
-seconds; `python -m pytest -q tests/test_dust.py` passes 39 in about 7 seconds.
+`python -m pytest -q` passes 117 tests (41 Dust, 76 existing) in about 26
+seconds; `python -m pytest -q tests/test_dust.py` passes 41 in about 22
+seconds.
 The default suite excludes the stale `tests/_reference` Torch/legacy
 expectations.
 
@@ -176,6 +183,15 @@ has no new third-party dependency.
   (SHA-256 `813cfbd2cc3eba7de0cd833528434f148e5c0d71c129c0592981fc2a3281593c`).
   The first 80% (274,364 bytes) is the training stream; an 8,192-byte window
   from the held-out 20% is the fixed evaluation set.
+  **Corpus drift:** these bytes are the corpus source, which has grown since
+  the runs, so a rebuild no longer reproduces them (433 KB from the
+  audit-time tree, 442 KB at the time of this note).  The default
+  `/tmp/opencode/dust_corpus.bin` path currently holds the drift-forward
+  433,396-byte corpus (SHA-256
+  `781397841d6cfef752bd33c4c35823ae2563091fbe71e1fee20d5ac6f6edf16a`), not
+  the recorded one.  The absolute losses in this report are bound to
+  `813cfbd2...`; a rerun must quote its own
+  `corpus_sha256` and must not be compared row-for-row with these tables.
 - **Sequence length:** 64 tokens (63 next-token predictions per step). This is
   far shorter than the paper's 2,048-token sequences and was chosen for CPU
   feasibility.
@@ -205,6 +221,42 @@ has no new third-party dependency.
 The corpus contains repository text and code. It is real byte-level text, but
 it is small, self-similar, and not a substitute for FineWeb or another
 pretraining corpus. Absolute losses are not comparable to the paper.
+
+### Estimator normalization note (post-benchmark)
+
+The rows above were measured before the batch-centered rewards received
+their `n/(n-1)` scale correction (`smaulbrain/dust.py`).  The estimator
+evaluates draws in batches of `chunk`; removing each batch's reward mean is
+unbiased variance reduction, but the realized batch mean correlates with its
+own draws, which biased the credited term `E[c_i a_i]` by `(n-1)/n` per
+batch.  Under the old rule the direct-site gradient scale therefore
+depended on the draw batch size rather than only on the documented
+`1/(K sigma)` estimator:
+
+- at the benchmark defaults (2 draws per group, chunk 8) the direct sites ran
+  as one batch of `n=2`, so their gradient expectation was exactly `0.5x`
+  the documented scale (K=4: `0.75x`);
+- the head estimator was nearly unaffected (about `0.97x`);
+- the local R/K/V estimator is uncentered itself but inherits the hub shrink
+  linearly;
+- at fixed draws, changing `chunk` changed the measured gradient magnitude
+  by up to about `1.9x` (T=8, 512 draws): a documented performance knob
+  acted as a hidden learning-rate knob.
+
+The correction restores the linear-regime scale: on the hub site
+(T=1, 512 draws, 8 seeds) the norm ratio against exact autograd is now
+chunk-invariant at `0.972 +/- 0.046` for draw batches 1-128, and this is
+pinned by `tests/test_dust.py`
+(`test_batch_centered_reward_correction_restores_linear_scale`,
+`test_direct_estimator_scale_is_chunk_invariant`).
+
+Consequences for the measured rows: rankings within one table remain
+internally consistent, but (a) the same `--dust-lr` corresponds to about
+twice the previous direct-site effective step size at the defaults; (b) the
+`K=2` and `K=4` rows differed pre-fix by both scale (`0.5x` vs `0.75x`) and
+variance, so K comparisons are qualitative; (c) new runs start from the
+corrected expectation and should not be interpolated into the old rows
+without re-measurement.
 
 ## Main results
 
@@ -421,6 +473,9 @@ tuning evidence rather than rerun as new benchmark rows.
   are rejected rather than approximated. The paper's estimator does not
   define discrete top-k routing, MTP objectives, or quantized forward
   semantics for this codebase.
+- **Pre-fix estimator scale.** The quality rows predate the `n/(n-1)`
+  batch-centering correction, and the K sweep mixes scale and variance
+  effects; see "Estimator normalization note (post-benchmark)" above.
 - **Non-matrix parameters are frozen.** This includes RMSNorm gains and the
   per-channel `attn.w`/`attn.u` gates. The optional ES fallback is broader
   than the paper's scalar ES and was not beneficial.
