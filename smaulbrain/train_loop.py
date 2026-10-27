@@ -221,8 +221,7 @@ class Trainer:
         self.model.store = None  # still references the freshly initialised experts; rebuilt below
         self.model.p = blob["params"]
         self.model._assert_counts()
-        self.model.packed.invalidate()
-        self.model.fp8.invalidate()
+        self.model.invalidate_quant_caches()
         flags = man.get("optimizer", {}).get("factored", {})
         self.opt.load_state_dict(blob.pop("opt_state"), flags, copy=False)
         self.opt.register(self.model.p)
@@ -400,8 +399,7 @@ class Trainer:
                 model.store.register_expert(nid, _expert_dict(cand, nid))
             model.store.n_experts = len(_model.expert_ids(cand))
             model.store.invalidate_all()
-        model.packed.invalidate()
-        model.fp8.invalidate()
+        model.invalidate_quant_caches()
         model._assert_counts()
 
     def train(self, max_steps=None, log_every=10, eval_every=0, ckpt_every=0,
@@ -446,8 +444,7 @@ class Trainer:
                     self.opt.step(self.model.p, grads, collect_norms=False)
                     # Only parameters with gradients were updated in-place. Invalidate
                     # their quantized representations, not every projection in the model.
-                    self.model.packed.invalidate(grads.keys())
-                    self.model.fp8.invalidate(grads.keys())
+                    self.model.invalidate_quant_caches(grads.keys())
                     if self.model.store is not None and self.spec.kind == "moe":
                         changed_experts = set()
                         for name in grads:
