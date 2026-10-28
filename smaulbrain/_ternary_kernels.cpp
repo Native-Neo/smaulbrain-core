@@ -500,45 +500,54 @@ extern "C" int smaulbrain_apply_ternary_update_segments(
     }
 
     std::vector<std::pair<std::size_t, int>> sorted;
-    sorted.reserve(total);
-    for (std::size_t s = 0; s < n_segments; ++s) {
-        for (std::size_t i = 0; i < segment_sizes[s]; ++i) {
-            const std::int32_t index = index_segments[s][i];
-            const int direction = static_cast<int>(direction_segments[s][i]);
-            if (index < 0 || static_cast<std::size_t>(index) >= n_weights ||
-                direction < -1 || direction > 1)
-                return 2;
-            if (direction != 0)
-                sorted.emplace_back(static_cast<std::size_t>(index), direction);
+    try {
+        sorted.reserve(total);
+        for (std::size_t s = 0; s < n_segments; ++s) {
+            for (std::size_t i = 0; i < segment_sizes[s]; ++i) {
+                const std::int32_t index = index_segments[s][i];
+                const int direction = static_cast<int>(direction_segments[s][i]);
+                if (index < 0 || static_cast<std::size_t>(index) >= n_weights ||
+                    direction < -1 || direction > 1)
+                    return 2;
+                if (direction != 0)
+                    sorted.emplace_back(static_cast<std::size_t>(index), direction);
+            }
         }
-    }
-    std::sort(sorted.begin(), sorted.end(),
-              [](const auto& a, const auto& b) { return a.first < b.first; });
+        std::sort(sorted.begin(), sorted.end(),
+                  [](const auto& a, const auto& b) { return a.first < b.first; });
 
-    std::size_t i = 0;
-    while (i < sorted.size()) {
-        const std::size_t index = sorted[i].first;
-        int vote = 0;
-        do {
-            vote += sorted[i].second;
-            ++i;
-        } while (i < sorted.size() && sorted[i].first == index);
-        const int direction = (vote > 0) - (vote < 0);
-        if (direction == 0) continue;
+        std::size_t i = 0;
+        while (i < sorted.size()) {
+            const std::size_t index = sorted[i].first;
+            int vote = 0;
+            do {
+                vote += sorted[i].second;
+                ++i;
+            } while (i < sorted.size() && sorted[i].first == index);
+            const int direction = (vote > 0) - (vote < 0);
+            if (direction == 0) continue;
 
-        const std::size_t byte_index = index >> 2;
-        const unsigned shift = static_cast<unsigned>((index & 3u) * 2u);
-        const unsigned old_byte = static_cast<unsigned>(packed[byte_index]);
-        const unsigned old_code = (old_byte >> shift) & 0x3u;
-        if (old_code > 2u) return 3;
-        const int candidate = static_cast<int>(old_code) + direction;
-        const unsigned new_code = static_cast<unsigned>(
-            std::max(0, std::min(2, candidate)));
-        if (new_code == old_code) continue;
-        const unsigned mask = 0x3u << shift;
-        packed[byte_index] = static_cast<std::uint8_t>(
-            (old_byte & ~mask) | (new_code << shift));
-        ++(*changed_count);
+            const std::size_t byte_index = index >> 2;
+            const unsigned shift = static_cast<unsigned>((index & 3u) * 2u);
+            const unsigned old_byte = static_cast<unsigned>(packed[byte_index]);
+            const unsigned old_code = (old_byte >> shift) & 0x3u;
+            if (old_code > 2u) return 3;
+            const int candidate = static_cast<int>(old_code) + direction;
+            const unsigned new_code = static_cast<unsigned>(
+                std::max(0, std::min(2, candidate)));
+            if (new_code == old_code) continue;
+            const unsigned mask = 0x3u << shift;
+            packed[byte_index] = static_cast<std::uint8_t>(
+                (old_byte & ~mask) | (new_code << shift));
+            ++(*changed_count);
+        }
+    } catch (...) {
+        // Allocation failure (bad_alloc on huge populations): the entry is
+        // noexcept, so an escaping exception would terminate the process.
+        // Fail into the same error channel as an invalid index instead; the
+        // Python wrapper turns any nonzero status into a RuntimeError.
+        // Same pattern as _optimizer_kernels.cpp.
+        return 2;
     }
     return 0;
 }
@@ -927,10 +936,9 @@ extern "C" int smaulbrain_tiled_transpose_matmat(
 // intermediate row-major buffer. Float thresholds are rounded down so that
 // (v > t_f) <=> (v > double threshold) for every float v: codes are identical
 // to the scalar reference.
-extern "C" int smaulbrain_pack_ternary_tiled(
+static int pack_ternary_tiled_impl(
     const float* w, std::uint8_t* out, std::size_t din, std::size_t dout,
-    float* scale_out, float* threshold_out) noexcept {
-    if (!w || !out || !scale_out || !threshold_out || din == 0 || dout == 0) return 1;
+    float* scale_out, float* threshold_out) {
 #if defined(__AVX__)
     const std::size_t n = din * dout;
     constexpr std::size_t kChunk = std::size_t{1} << 16;
@@ -1041,10 +1049,29 @@ extern "C" int smaulbrain_pack_ternary_tiled(
 #endif
 }
 
+extern "C" int smaulbrain_pack_ternary_tiled(
+    const float* w, std::uint8_t* out, std::size_t din, std::size_t dout,
+    float* scale_out, float* threshold_out) noexcept {
+    if (!w || !out || !scale_out || !threshold_out || din == 0 || dout == 0) return 1;
+    try {
+        return pack_ternary_tiled_impl(w, out, din, dout, scale_out, threshold_out);
+    } catch (...) {
+        // Allocation failure (partials/scratch resident buffers): the entry is
+        // noexcept, so an escaping exception would terminate the process.
+        // Report a nonzero status; the Python wrapper falls back to the
+        // pure-NumPy packer on any failure.  Same pattern as
+        // _optimizer_kernels.cpp.
+        return 2;
+    }
+}
+
 // Pack a batch of matrices with one FFI crossing. The per-matrix pack routine
 // is unchanged, so scales, thresholds, and codes are identical to individual
 // calls. `weights` points at an array of float pointers; `sizes` is the packed
 // byte count for each matrix, and the outputs are contiguous in that order.
+// This entry performs no allocation of its own and the per-matrix routine
+// reports allocation failure through its own status, so nonzero statuses here
+// always come from argument validation or the per-matrix call.
 extern "C" int smaulbrain_pack_ternary_tiled_many(
     const void* weights, std::uint8_t* out, const std::size_t* sizes,
     const std::size_t* dins, const std::size_t* douts,
