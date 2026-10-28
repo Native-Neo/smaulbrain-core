@@ -1,6 +1,8 @@
 """Evidence-based expert pruning with atomic checkpoint replacement."""
 import math
 
+import numpy as np
+
 from . import checkpoint as _ckpt
 from . import growth as _growth
 from . import model as _model
