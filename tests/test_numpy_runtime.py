@@ -233,6 +233,27 @@ def test_safetensors_and_quant_roundtrip(tmp_path):
     assert q.shape == W.shape and np.isfinite(qscale)
 
 
+def test_safetensors_zero_dim_roundtrip(tmp_path):
+    path = tmp_path / "scalars.safetensors"
+    arrays = {
+        "scale": np.asarray(2.25, dtype=np.float32),
+        "count": np.zeros((), dtype=np.int64),
+    }
+    safetensors_np.save_file(arrays, path, metadata={"kind": "test"})
+    loaded, metadata = safetensors_np.load_file(path)
+    assert metadata.get("kind") == "test"
+    assert "__np_zero_dim__" not in metadata
+    for name, value in arrays.items():
+        assert loaded[name].shape == ()
+        np.testing.assert_array_equal(loaded[name], value)
+
+    # Genuine (1,)-shaped tensors are not confused with the scalar marker and
+    # stay 1-dimensional on the roundtrip.
+    plain = tmp_path / "plain.safetensors"
+    safetensors_np.save_file({"plain": np.zeros((1,), np.float32)}, plain)
+    assert safetensors_np.load_file(plain)[0]["plain"].shape == (1,)
+
+
 def test_batched_native_optimizer_matches_single_matrix_path(monkeypatch):
     rng = np.random.default_rng(23)
     shapes = [(32, 32), (33, 64), (128, 32), (32,)]
