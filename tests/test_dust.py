@@ -617,6 +617,19 @@ def test_dust_resume_restores_optimizer_hyperparameters(tmp_path):
     assert changed.sched.global_step == 1
 
 
+def test_checkpoint_carries_the_optimizer_update_counter(tmp_path):
+    tr = _trainer(tmp_path, trainer="backprop", seq_len=8)
+    tr.train(max_steps=3, log_every=0, ckpt_every=0, grad_clip=100.0)
+    assert tr.opt.n_updates == 3
+    tr.save()
+    man = ckpt.load_checkpoint(str(tmp_path / "run"))["manifest"]
+    assert man["optimizer"]["n_updates"] == 3
+
+    resumed = _trainer(tmp_path / "resume", trainer="backprop", seq_len=8)
+    resumed.load(tmp_path / "run")
+    assert resumed.opt.n_updates == 3
+
+
 def test_dust_ctrl_c_saves_at_committed_step(tmp_path, monkeypatch):
     opts = [
         "--dust-writer-draws", "1", "--dust-hidden-draws", "1",
