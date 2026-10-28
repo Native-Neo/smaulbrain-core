@@ -784,11 +784,6 @@ class DustEngine:
         error /= np.float32(draws)
         return error
 
-    def _local_errors(self, kind, draws, sigma, targets, rng, clean, stats):
-        return [self._local_error_block(
-            kind, layer, draws, sigma, targets[layer], rng, clean, stats)
-            for layer in range(self.L)]
-
     # -- non-matrix parameters ---------------------------------------------
     def _scalar_gradients(self, tokens, rng, clean, stats):
         draws = int(self.config.scalar_draws)
