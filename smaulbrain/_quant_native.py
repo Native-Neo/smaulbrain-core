@@ -12,10 +12,17 @@ Backward modes:
             ternary weights used in forward, upstream grads untouched.
   ternary : input grads computed with packed ternary weights (packed kernel);
             weight grads use STE (documented surrogate: dL/dW_latent = dL/dW_q).
-  fp8     : activations/grads rounded through E4M3 simulation; weight grads STE.
-FP8 E4M3: 1 sign + 4 exp (bias 8) + 3 mantissa; subnormals, saturation to
-max 448.0, NaN/Inf preserved as fp32 sentinel (no hardware NaN payload).
-CPU FP8 is software-emulated (no native FP8 on Ivy Bridge).
+  fp8     : activations/grads rounded through the FP8 simulation; weight
+            grads STE.
+FP8 emulation: 1 sign + 4 exp (bias 8) + 3 mantissa, saturation to max
+448.0, NaN/Inf preserved as fp32 sentinel (no hardware NaN payload).  The
+representable grid is NOT the IEEE E4M3 reference set: out of 135 positive
+values, 131 match a bias-8 reference enumeration; in the bottom binade the
+grid keeps the original scalar implementation's eight quarter-steps of
+2^-8 (odd multiples of 2^-11) instead of the reference's four upper
+subnormals (m/8 * 2^-7 for m = 4..7).  Grid and rounding are frozen for
+checkpoint/parity stability; `_make_fp8_positive_values` constructs the
+exact set.  CPU FP8 is software-emulated (no native FP8 on Ivy Bridge).
 """
 import numpy as np
 
