@@ -30,10 +30,6 @@ def decode_ids(ids) -> bytes:
     return bytes(int(i) for i in ids if 0 <= int(i) <= 255)
 
 
-def is_special(tok: int) -> bool:
-    return int(tok) >= 256
-
-
 def vocab_meta() -> dict:
     return {
         "vocab_size": VOCAB_SIZE,
