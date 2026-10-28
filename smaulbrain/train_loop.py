@@ -170,6 +170,7 @@ class Trainer:
             opt_meta = {"class": "DustSGD", "lr": self.opt.lr,
                         "momentum": self.opt.momentum,
                         "weight_decay": self.opt.weight_decay,
+                        "n_updates": int(self.opt.n_updates),
                         "algorithm": "dust"}
         else:
             factored = {k: bool(state["factored"])
@@ -178,6 +179,7 @@ class Trainer:
                         "beta1": self.opt.beta1, "beta2": self.opt.beta2,
                         "eps": self.opt.eps,
                         "weight_decay": self.opt.weight_decay,
+                        "n_updates": int(self.opt.n_updates),
                         "factored": factored}
         return _ckpt.build_manifest(
             self.spec.name, arch, extra, self.sched.to_record(),
@@ -225,6 +227,13 @@ class Trainer:
         flags = man.get("optimizer", {}).get("factored", {})
         self.opt.load_state_dict(blob.pop("opt_state"), flags, copy=False)
         self.opt.register(self.model.p)
+        # The update counter is bookkeeping (the factored update needs no bias
+        # correction), but it should survive a resume so optimizer state
+        # reports stay truthful; old manifests without it keep the counter at
+        # its constructor default, as before this field existed.
+        saved_n_updates = man.get("optimizer", {}).get("n_updates")
+        if saved_n_updates is not None:
+            self.opt.n_updates = int(saved_n_updates)
         if self.algorithm == "dust":
             from . import dust as _dust
             if "dust" not in ck_cfg:
