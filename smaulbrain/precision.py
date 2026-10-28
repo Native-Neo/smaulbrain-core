@@ -191,11 +191,6 @@ def int8_dequantize(codes, scale) -> np.ndarray:
     return out
 
 
-def int8_roundtrip(array, scale=None):
-    codes, used_scale = int8_quantize(array, scale=scale)
-    return int8_dequantize(codes, used_scale)
-
-
 # ---------------------------------------------------------------------------
 # Stored activation
 # ---------------------------------------------------------------------------
