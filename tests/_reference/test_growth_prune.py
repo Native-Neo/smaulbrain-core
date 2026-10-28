@@ -243,15 +243,20 @@ def grown_checkpoint(tmp_path, steps=2):
 
 def test_rank_for_prune_guards():
     with pytest.raises(ValueError, match="must be positive"):
-        P.rank_for_prune({}, {}, 0, 2, 4)
+        P.rank_for_prune({}, 0, 2, 4)
     with pytest.raises(ValueError, match="cannot remove"):
-        P.rank_for_prune({}, {}, 4, 2, 4)
+        P.rank_for_prune({}, 4, 2, 4)
     with pytest.raises(ValueError, match="top_k"):
-        P.rank_for_prune({}, {}, 3, 2, 4)
+        P.rank_for_prune({}, 3, 2, 4)
+    # non-finite evidence must refuse pruning, not rank by sort accident
+    with pytest.raises(ValueError, match="non-finite"):
+        P.rank_for_prune({0: float("nan")}, 1, 1, 1)
+    with pytest.raises(ValueError, match="non-finite"):
+        P.rank_for_prune({0: 0.0, 1: float("inf")}, 1, 1, 2)
     # ascending scores, deterministic tie-break by expert id
     scores = {0: -1.0, 1: 0.5, 2: 0.5, 3: 2.0}
-    assert P.rank_for_prune({}, scores, 2, 1, 4) == [0, 1]
-    assert P.rank_for_prune({}, scores, 1, 1, 4) == [0]
+    assert P.rank_for_prune(scores, 2, 1, 4) == [0, 1]
+    assert P.rank_for_prune(scores, 1, 1, 4) == [0]
 
 
 def test_prune_dry_run_requires_consent_and_evidence(tmp_path):
