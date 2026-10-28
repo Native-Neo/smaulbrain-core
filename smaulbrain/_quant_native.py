@@ -439,6 +439,13 @@ def sample_ternary_gradient_updates(
     The gradient may be a non-contiguous two-dimensional view, such as the
     transpose of a PyTorch GEMM result. Returns flat logical indices and update
     directions, or None when the native backend is unavailable.
+
+    Draws are stateless: every cell's uniform is derived from
+    ``splitmix64(seed ^ index * golden)`` and only its own cell contributes to
+    the acceptance test, so a capacity-limited retry re-selects the identical
+    cells (and so does any later call with the same gradient and seed).  Note
+    this deliberately differs from an ordered-generator NumPy fallback, whose
+    same-seed selections are stream-order dependent.
     """
     if not prepare_ternary_backend():
         return None
