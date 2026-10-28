@@ -49,6 +49,11 @@ def build_here(build_dir="", verbose: bool = True) -> str:
     import subprocess
     import tempfile
 
+    # Report a missing source before anything else: without it the compiler
+    # error below would send someone hunting for c++ on a source-less install.
+    source = Path(__file__).resolve().parent / "cpu_kernels.cpp"
+    if not source.is_file():
+        raise RuntimeError(f"native kernel source missing: {source}")
     resolved = _digest_and_target(_cpu.detect())
     if resolved is None:
         raise RuntimeError(
