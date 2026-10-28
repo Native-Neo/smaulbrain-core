@@ -254,6 +254,22 @@ def test_safetensors_zero_dim_roundtrip(tmp_path):
     assert safetensors_np.load_file(plain)[0]["plain"].shape == (1,)
 
 
+def test_checkpoint_writer_preserves_zero_dim_scalars(tmp_path):
+    # Optimizer bookkeeping may carry rank-0 arrays; the checkpoint tree must
+    # round-trip them as scalars (via the __np_zero_dim__ marker), never as
+    # shape (1,), or a strict restore would reject the wrong shape.
+    scalar = np.asarray(np.float32(1.5))
+    opt_state = {"w": {"m": np.zeros((2, 2), np.float32), "extra": scalar}}
+    flat = {}
+    ckpt._flatten("", ckpt._cpu_tree(opt_state), flat)
+    path = tmp_path / "optim.safetensors"
+    safetensors_np.save_file(flat, path, metadata={"format": "smaulbrain-optim"})
+    loaded, metadata = safetensors_np.load_file(path)
+    assert loaded["w::m"].shape == (2, 2)
+    assert loaded["w::extra"].shape == ()
+    np.testing.assert_array_equal(loaded["w::extra"], scalar)
+
+
 def test_batched_native_optimizer_matches_single_matrix_path(monkeypatch):
     rng = np.random.default_rng(23)
     shapes = [(32, 32), (33, 64), (128, 32), (32,)]
