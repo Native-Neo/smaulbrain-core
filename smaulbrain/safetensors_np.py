@@ -4,6 +4,11 @@ Implements the published safetensors container directly (8-byte little-endian
 header length, UTF-8 JSON header, raw little-endian tensor bytes) so the runtime
 does not need a compiled dependency. Only dense, C-contiguous arrays are stored,
 which is exactly what the model and optimizer produce.
+
+The published format cannot represent zero-dimensional arrays, so a 0-d tensor
+is stored as shape ``[1]`` and its name is recorded under the reserved
+``__np_zero_dim__`` metadata key; :func:`load_file` reshapes those back to
+scalars so a roundtrip preserves the original shapes exactly.
 """
 from __future__ import annotations
 
@@ -41,16 +46,23 @@ def _metadata_strings(metadata):
     return {str(k): str(v) for k, v in metadata.items()}
 
 
+_SCALAR_METADATA_KEY = "__np_zero_dim__"
+
+
 def save_file(tensors, filename, metadata=None):
-    """Write ``{name: ndarray}`` to ``filename`` in safetensors format."""
+    """Write ``{name: ndarray}`` to ``filename`` in safetensors format.
+
+    Zero-dimensional arrays are stored as shape ``[1]`` (the format has no
+    rank-0 strings) and named in the reserved ``__np_zero_dim__`` metadata
+    entry, so :func:`load_file` can return them as scalars again.
+    """
     filename = os.fspath(filename)
     parent = os.path.dirname(os.path.abspath(filename))
     if parent:
         os.makedirs(parent, exist_ok=True)
     header = {}
     meta = _metadata_strings(metadata)
-    if meta:
-        header["__metadata__"] = meta
+    scalar_names = []
     payload = []
     offset = 0
     for name, value in tensors.items():
@@ -59,18 +71,29 @@ def save_file(tensors, filename, metadata=None):
         arr = np.asarray(value)
         if arr.dtype.byteorder not in ("=", "|"):
             arr = arr.astype(arr.dtype.newbyteorder("="))
-        arr = np.ascontiguousarray(arr)
-        dtype = _DTYPE_TO_ST.get(arr.dtype)
+        scalar = arr.ndim == 0
+        stored = np.ascontiguousarray(arr.reshape(1) if scalar else arr)
+        dtype = _DTYPE_TO_ST.get(stored.dtype)
         if dtype is None:
-            raise TypeError(f"unsupported safetensors dtype {arr.dtype} for {name}")
-        nbytes = int(arr.nbytes)
+            raise TypeError(f"unsupported safetensors dtype {stored.dtype} for {name}")
+        nbytes = int(stored.nbytes)
         header[name] = {
             "dtype": dtype,
-            "shape": [int(s) for s in arr.shape],
+            "shape": [int(s) for s in stored.shape],
             "data_offsets": [offset, offset + nbytes],
         }
-        payload.append(arr.tobytes(order="C"))
+        payload.append(stored.tobytes(order="C"))
         offset += nbytes
+        if scalar:
+            scalar_names.append(name)
+    if scalar_names:
+        meta = dict(meta) if meta else {}
+        marker = json.dumps(scalar_names, separators=(",", ":"))
+        if meta.get(_SCALAR_METADATA_KEY, marker) != marker:
+            raise ValueError(f"reserved metadata key {_SCALAR_METADATA_KEY} is in use")
+        meta[_SCALAR_METADATA_KEY] = marker
+    if meta:
+        header["__metadata__"] = meta
     raw_header = json.dumps(header, separators=(",", ":"), ensure_ascii=False).encode("utf-8")
     # Pad the header so the data section starts on an 8-byte boundary.
     padding = (-(8 + len(raw_header))) % 8
@@ -130,6 +153,17 @@ def load_file(filename):
     if not isinstance(header, dict):
         raise ValueError(f"{filename}: safetensors header is not an object")
     metadata = header.pop("__metadata__", None) or {}
+    zero_dim = set()
+    if _SCALAR_METADATA_KEY in metadata:
+        marker = metadata[_SCALAR_METADATA_KEY]
+        try:
+            names = json.loads(marker)
+            if not isinstance(names, list) or not all(isinstance(n, str) for n in names):
+                raise ValueError
+        except (ValueError, json.JSONDecodeError) as exc:
+            raise ValueError(f"{filename}: malformed {_SCALAR_METADATA_KEY} marker") from exc
+        zero_dim = set(names)
+        metadata = {k: v for k, v in metadata.items() if k != _SCALAR_METADATA_KEY}
     tensors = {}
     spans = []
     for name, spec in header.items():
@@ -163,6 +197,12 @@ def load_file(filename):
         arr = np.frombuffer(data[start:end], dtype=dtype).reshape(shape).copy()
         if arr.dtype == np.uint8 and spec.get("dtype") == "BOOL":
             arr = arr.astype(np.bool_)
+        if name in zero_dim:
+            if arr.shape != (1,):
+                raise ValueError(
+                    f"{filename}: tensor {name!r} is marked zero-dimensional "
+                    f"but was stored with shape {arr.shape}")
+            arr = arr.reshape(())
         tensors[name] = arr
     return tensors, metadata
 
