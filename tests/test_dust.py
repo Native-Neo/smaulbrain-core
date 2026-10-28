@@ -612,6 +612,7 @@ def test_dust_resume_restores_optimizer_hyperparameters(tmp_path):
     changed.load(tmp_path / "a" / "run")
     assert changed.opt.lr == pytest.approx(0.05)
     assert changed.opt.momentum == pytest.approx(0.9)
+    assert changed.opt.n_updates == 1
     assert changed.dust_config.lr == pytest.approx(0.05)
     assert changed.dust_config.momentum == pytest.approx(0.9)
     assert changed.sched.global_step == 1
