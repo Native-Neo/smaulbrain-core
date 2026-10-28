@@ -108,7 +108,12 @@ def _array(value):
         value = value.data
     if np.isscalar(value):
         return np.asarray(value)
-    return np.ascontiguousarray(np.asarray(value))
+    array = np.asarray(value)
+    if array.ndim == 0:
+        # save_file stores rank-0 arrays under the __np_zero_dim__ marker;
+        # promoting them to (1,) here would round-trip as the wrong shape.
+        return array
+    return np.ascontiguousarray(array)
 
 
 def _cpu_tree(obj):
